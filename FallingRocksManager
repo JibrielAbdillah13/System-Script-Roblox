@@ -1,0 +1,80 @@
+local TweenService = game:GetService("TweenService")
+local Players = game:GetService("Players")
+
+-- KONFIGURASI
+local FOLDER_NAME = "FallingRocks"
+local FALL_DELAY = 0.3 
+local RESET_DELAY = 1.7  
+local TWEEN_TIME = 1.5 
+
+local TWEEN_INFO = TweenInfo.new(TWEEN_TIME, Enum.EasingStyle.Sine, Enum.EasingDirection.Out)
+
+local fallingRocksFolder = workspace:WaitForChild(FOLDER_NAME)
+
+local function setupStone(stone)
+	if not stone:IsA("BasePart") then return end
+
+	-- Simpan data awal
+	local initialCFrame = stone.CFrame
+	local isFalling = false
+
+	-- Cari objek suara di dalam batu
+	local soundJatuh = stone:FindFirstChild("SoundJatuh") -- Suara A
+	local soundReset = stone:FindFirstChild("SoundReset") -- Suara B
+
+	stone.Touched:Connect(function(hit)
+		local character = hit.Parent
+		local humanoid = character:FindFirstChild("Humanoid")
+
+		if humanoid and not isFalling then
+			isFalling = true
+
+			task.wait(FALL_DELAY)
+
+			-- 1. PROSES JATUH
+			stone.Anchored = false
+
+			-- PLAY SUARA A (JATUH)
+			if soundJatuh then
+				soundJatuh:Play()
+			end
+
+			-- TUNGGU RESET
+			task.wait(RESET_DELAY)
+
+			if not stone or not stone.Parent then return end
+
+			-- 2. PROSES RESET
+			stone.Anchored = true 
+
+			-- Reset kecepatan fisik agar stabil
+			stone.AssemblyLinearVelocity = Vector3.new(0,0,0)
+			stone.AssemblyAngularVelocity = Vector3.new(0,0,0)
+
+			-- Tween kembali ke atas
+			local tween = TweenService:Create(stone, TWEEN_INFO, {CFrame = initialCFrame})
+			tween:Play()
+
+			tween.Completed:Connect(function()
+				stone.CFrame = initialCFrame
+
+				-- PLAY SUARA B (KEMBALI KE POSISI)
+				if soundReset then
+					soundReset:Play()
+				end
+
+				task.wait(0.5)
+				isFalling = false
+			end)
+		end
+	end)
+end
+
+-- Inisialisasi
+for _, stone in pairs(fallingRocksFolder:GetChildren()) do
+	setupStone(stone)
+end
+
+fallingRocksFolder.ChildAdded:Connect(function(child)
+	setupStone(child)
+end)
