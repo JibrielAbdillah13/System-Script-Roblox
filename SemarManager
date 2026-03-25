@@ -1,0 +1,24 @@
+--local model = script.Parent
+local folderkantong = workspace:WaitForChild("KantongSemar")
+
+local function launchPlayer(hit)
+	local character = hit.Parent
+	local humanoid = character:FindFirstChildWhichIsA("Humanoid")
+	local rootPart = character:FindFirstChild("HumanoidRootPart")
+
+	if humanoid and rootPart then
+		local bodyVelocity = Instance.new("BodyVelocity")
+		bodyVelocity.Velocity = Vector3.new(0, 130, 0) -- ubah angka untuk kekuatan lontaran
+		bodyVelocity.MaxForce = Vector3.new(0, math.huge, 0)
+		bodyVelocity.Parent = rootPart
+
+		game:GetService("Debris"):AddItem(bodyVelocity, 0.1)
+	end
+end
+
+-- Loop semua descendant, cari yang namanya "Daun"
+for _, part in ipairs(folderkantong:GetDescendants()) do
+	if part.Name == "Daun" and part:IsA("BasePart") then
+		part.Touched:Connect(launchPlayer)
+	end
+end
