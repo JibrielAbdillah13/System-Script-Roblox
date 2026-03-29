@@ -1,0 +1,366 @@
+-- ============================================================
+-- 🎬 LOCAL SCRIPT - CutScene Manager
+-- Letakkan di: StarterPlayerScripts
+-- ============================================================
+
+local TweenService      = game:GetService("TweenService")
+local Players           = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local player    = Players.LocalPlayer
+local char      = player.Character or player.CharacterAdded:Wait()
+local humanoid  = char:WaitForChild("Humanoid")
+local cam       = workspace.CurrentCamera
+
+--Hide GUI
+local Backgui   = player:WaitForChild("PlayerGui"):WaitForChild("BackpackGui")
+
+-- ============================================================
+-- 📡 Tunggu RemoteEvents dari server
+-- ============================================================
+local remoteFolder = ReplicatedStorage:WaitForChild("CutsceneRemotes", 15)
+if not remoteFolder then
+	warn("❌ Folder CutsceneRemotes tidak ditemukan!")
+	return
+end
+
+local remoteAwal   = remoteFolder:WaitForChild("StartCutSceneAwal", 15)
+local remote1      = remoteFolder:WaitForChild("StartCutScene1",      15)
+local remoteSummit = remoteFolder:WaitForChild("StartCutSceneSummit", 15)
+
+if not remote1 or not remoteSummit then
+	warn("❌ RemoteEvents tidak ditemukan!")
+	return
+end
+
+-- ============================================================
+-- 🛠️ HELPER UMUM
+-- ============================================================
+local function waitLongest(durationA, durationB)
+	task.wait(math.max(durationA, durationB))
+end
+
+local function makeBars(guiName)
+	local bh = 80
+
+	local sg = Instance.new("ScreenGui")
+	sg.Name            = guiName
+	sg.ResetOnSpawn    = false
+	sg.IgnoreGuiInset  = true
+	sg.Parent          = player.PlayerGui
+
+	local top = Instance.new("Frame")
+	top.Name             = "TopBar"
+	top.Size             = UDim2.new(1, 0, 0, bh)
+	top.Position         = UDim2.new(0, 0, 0, -bh)
+	top.BackgroundColor3 = Color3.new(0, 0, 0)
+	top.BorderSizePixel  = 0
+	top.Parent           = sg
+
+	local bot = Instance.new("Frame")
+	bot.Name             = "BottomBar"
+	bot.Size             = UDim2.new(1, 0, 0, bh)
+	bot.Position         = UDim2.new(0, 0, 1, 0)
+	bot.BackgroundColor3 = Color3.new(0, 0, 0)
+	bot.BorderSizePixel  = 0
+	bot.Parent           = sg
+
+	return sg, top, bot, bh
+end
+
+local function showBars(top, bot, bh)
+	local info = TweenInfo.new(0.6, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+	TweenService:Create(top, info, {Position = UDim2.new(0,0,0,0)}):Play()
+	TweenService:Create(bot, info, {Position = UDim2.new(0,0,1,-bh)}):Play()
+	task.wait(0.6)
+end
+
+local function hideBars(top, bot, bh)
+	local info = TweenInfo.new(0.8, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
+	TweenService:Create(top, info, {Position = UDim2.new(0,0,0,-bh)}):Play()
+	TweenService:Create(bot, info, {Position = UDim2.new(0,0,1,0)}):Play()
+	task.wait(0.8)
+end
+--===================================================================================
+
+-- ╔══════════════════════════════════════════════════════════════╗
+-- ║      🌲 CUTSCENE Awal - Welcome in Mount Daives (BASE)  	  ║
+-- ╚══════════════════════════════════════════════════════════════╝
+
+-- GUI CutSceneAwal (GUI di dalam StarterGui)
+local screenGui, topBar, bottomBar, barHeight = makeBars("CinematicBars")
+
+-- Sound CutSceneAwal (dibuat saat remote diterima, bukan saat load)
+local sound1, sound2, ambruk
+
+-- ============================================================
+-- 📡 Terima sinyal dari server → jalankan CutScene1
+-- Server mengirim: cam1, dustPart, particleEmitter
+-- ============================================================
+remote1.OnClientEvent:Connect(function(cam1, dustPart, particleEmitter)
+
+	-- Setup sound (baru dibuat setelah objek cam1 & dustPart diterima dari server)
+	if not sound1 then
+		sound1 = cam1:FindFirstChildOfClass("Sound") or Instance.new("Sound", cam1)
+		sound1.SoundId = "rbxassetid://96646052867948"  -- percakapan 1 (7 detik)
+	end
+
+	if not sound2 then
+		sound2 = Instance.new("Sound", cam1)
+		sound2.SoundId     = "rbxassetid://128926022108796"  -- percakapan 2 (6 detik)
+		sound2.Volume      = 1
+		sound2.RollOffMode = "Linear"
+	end
+
+	if not ambruk then
+		ambruk = Instance.new("Sound", dustPart)
+		ambruk.SoundId = "rbxassetid://9113384036"  -- suara pohon ambruk
+		ambruk.Volume  = 1
+	end
+
+	print("▶ CutScene1 dimulai")
+
+	-- 🔒 Bekukan player
+	humanoid.WalkSpeed  = 0
+	humanoid.JumpHeight = 0
+
+	--Matikan sebentar backpack gui nya
+	Backgui.Enabled = false
+
+	ambruk:Play()
+	showBars(topBar, bottomBar, barHeight)
+
+	cam.CameraType = Enum.CameraType.Scriptable
+	cam.CFrame     = cam1.CFrame
+	particleEmitter.Enabled = true
+
+	-- 🎥 Scene 1: zoom in
+	local tween1Duration = 5
+	local sound1Duration = 7
+	local tween1 = TweenService:Create(cam,
+		TweenInfo.new(tween1Duration, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut),
+		{CFrame = cam1.CFrame + (cam1.CFrame.LookVector * 10)}
+	)
+	tween1:Play()
+	sound1:Play()
+	waitLongest(tween1Duration, sound1Duration)
+
+	-- 🎥 Scene 2: putar -115°
+	local rotated = cam.CFrame * CFrame.Angles(0, math.rad(-115), 0)
+	local tween2 = TweenService:Create(cam,
+		TweenInfo.new(6, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut),
+		{CFrame = rotated}
+	)
+	tween2:Play()
+	task.wait(2)
+	sound2:Play()
+	task.wait(6)
+
+	-- 🎬 Akhiri CutScene1
+	print("✅ CutScene1 selesai")
+	hideBars(topBar, bottomBar, barHeight)
+	particleEmitter.Enabled = false
+	cam.CameraType          = Enum.CameraType.Custom
+	humanoid.WalkSpeed      = 16
+	humanoid.JumpHeight     = 7.2
+
+	task.wait(1)
+	screenGui:Destroy()
+
+	--Nyalakan lagi backpack gui nya
+	Backgui.Enabled = true
+
+end)
+
+--===================================================================================
+-- ╔══════════════════════════════════════════════════════════════╗
+-- ║          🌲 CUTSCENE 1 - POHON TUMBANG (BASE)               ║
+-- ╚══════════════════════════════════════════════════════════════╝
+
+-- GUI CutScene1
+local screenGui, topBar, bottomBar, barHeight = makeBars("CinematicBars")
+
+-- Sound CutScene1 (dibuat saat remote diterima, bukan saat load)
+local sound1, sound2, ambruk
+
+-- ============================================================
+-- 📡 Terima sinyal dari server → jalankan CutScene1
+-- Server mengirim: cam1, dustPart, particleEmitter
+-- ============================================================
+remote1.OnClientEvent:Connect(function(cam1, dustPart, particleEmitter)
+
+	-- Setup sound (baru dibuat setelah objek cam1 & dustPart diterima dari server)
+	if not sound1 then
+		sound1 = cam1:FindFirstChildOfClass("Sound") or Instance.new("Sound", cam1)
+		sound1.SoundId = "rbxassetid://96646052867948"  -- percakapan 1 (7 detik)
+	end
+
+	if not sound2 then
+		sound2 = Instance.new("Sound", cam1)
+		sound2.SoundId     = "rbxassetid://128926022108796"  -- percakapan 2 (6 detik)
+		sound2.Volume      = 1
+		sound2.RollOffMode = "Linear"
+	end
+
+	if not ambruk then
+		ambruk = Instance.new("Sound", dustPart)
+		ambruk.SoundId = "rbxassetid://9113384036"  -- suara pohon ambruk
+		ambruk.Volume  = 1
+	end
+
+	print("▶ CutScene1 dimulai")
+
+	-- 🔒 Bekukan player
+	humanoid.WalkSpeed  = 0
+	humanoid.JumpHeight = 0
+	
+	--Matikan sebentar backpack gui nya
+	Backgui.Enabled = false
+	
+	ambruk:Play()
+	showBars(topBar, bottomBar, barHeight)
+
+	cam.CameraType = Enum.CameraType.Scriptable
+	cam.CFrame     = cam1.CFrame
+	particleEmitter.Enabled = true
+
+	-- 🎥 Scene 1: zoom in
+	local tween1Duration = 5
+	local sound1Duration = 7
+	local tween1 = TweenService:Create(cam,
+		TweenInfo.new(tween1Duration, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut),
+		{CFrame = cam1.CFrame + (cam1.CFrame.LookVector * 10)}
+	)
+	tween1:Play()
+	sound1:Play()
+	waitLongest(tween1Duration, sound1Duration)
+
+	-- 🎥 Scene 2: putar -115°
+	local rotated = cam.CFrame * CFrame.Angles(0, math.rad(-115), 0)
+	local tween2 = TweenService:Create(cam,
+		TweenInfo.new(6, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut),
+		{CFrame = rotated}
+	)
+	tween2:Play()
+	task.wait(2)
+	sound2:Play()
+	task.wait(6)
+
+	-- 🎬 Akhiri CutScene1
+	print("✅ CutScene1 selesai")
+	hideBars(topBar, bottomBar, barHeight)
+	particleEmitter.Enabled = false
+	cam.CameraType          = Enum.CameraType.Custom
+	humanoid.WalkSpeed      = 16
+	humanoid.JumpHeight     = 7.2
+	
+	task.wait(1)
+	screenGui:Destroy()
+	
+	--Nyalakan lagi backpack gui nya
+	Backgui.Enabled = true
+	
+end)
+
+-- ╔══════════════════════════════════════════════════════════════╗
+-- ║          🏔️  CUTSCENE SUMMIT - PUNCAK                        ║
+-- ╚══════════════════════════════════════════════════════════════╝
+
+local splayer   = Players.LocalPlayer
+local schar     = splayer.Character or splayer.CharacterAdded:Wait()
+local shumanoid = schar:WaitForChild("Humanoid")
+local scam      = workspace.CurrentCamera
+
+-- GUI Summit
+local screenGuiSummit = Instance.new("ScreenGui")
+screenGuiSummit.Name           = "CinematicBarsSummit"
+screenGuiSummit.ResetOnSpawn   = false
+screenGuiSummit.IgnoreGuiInset = true
+screenGuiSummit.Parent         = splayer.PlayerGui
+
+local topBarSummit = Instance.new("Frame")
+topBarSummit.Name             = "TopBar"
+topBarSummit.Size             = UDim2.new(1, 0, 0, 80)
+topBarSummit.Position         = UDim2.new(0, 0, 0, -80)
+topBarSummit.BackgroundColor3 = Color3.new(0, 0, 0)
+topBarSummit.BorderSizePixel  = 0
+topBarSummit.Parent           = screenGuiSummit
+
+local bottomBarSummit = Instance.new("Frame")
+bottomBarSummit.Name             = "BottomBar"
+bottomBarSummit.Size             = UDim2.new(1, 0, 0, 80)
+bottomBarSummit.Position         = UDim2.new(0, 0, 1, 0)
+bottomBarSummit.BackgroundColor3 = Color3.new(0, 0, 0)
+bottomBarSummit.BorderSizePixel  = 0
+bottomBarSummit.Parent           = screenGuiSummit
+
+local function showBarsSummit()
+	local info = TweenInfo.new(0.6, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+	TweenService:Create(topBarSummit,    info, {Position = UDim2.new(0,0,0,0)}):Play()
+	TweenService:Create(bottomBarSummit, info, {Position = UDim2.new(0,0,1,-80)}):Play()
+	task.wait(0.6)
+end
+
+local function hideBarsSummit()
+	local info = TweenInfo.new(0.8, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
+	TweenService:Create(topBarSummit,    info, {Position = UDim2.new(0,0,0,-80)}):Play()
+	TweenService:Create(bottomBarSummit, info, {Position = UDim2.new(0,0,1,0)}):Play()
+	task.wait(0.8)
+end
+
+-- Sound Summit
+local soundv1
+
+-- ============================================================
+-- 📡 Terima sinyal dari server → jalankan CutScene Summit
+-- Server mengirim: scam1
+-- ============================================================
+remoteSummit.OnClientEvent:Connect(function(scam1)
+
+	-- Setup sound
+	if not soundv1 then
+		soundv1 = scam1:FindFirstChildOfClass("Sound") or Instance.new("Sound", scam1)
+		soundv1.SoundId     = "rbxassetid://133115232597397"  -- percakapan 1 (15 detik)
+		soundv1.RollOffMode = "Linear"
+	end
+
+	print("▶ CutScene Summit dimulai")
+	
+	--Matikan sebentar backpack gui nya
+	Backgui.Enabled = false
+	
+	shumanoid.WalkSpeed  = 0
+	shumanoid.JumpHeight = 0
+
+	showBarsSummit()
+
+	scam.CameraType = Enum.CameraType.Scriptable
+	scam.CFrame     = scam1.CFrame
+
+	-- 🎥 Scene 1: zoom in jauh
+	local tween1Duration = 20
+	local sound1Duration = 15
+	local tween1 = TweenService:Create(scam,
+		TweenInfo.new(tween1Duration, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut),
+		{CFrame = scam1.CFrame + (scam1.CFrame.LookVector * 240)}
+	)
+	tween1:Play()
+	soundv1:Play()
+	waitLongest(tween1Duration, sound1Duration)
+
+	-- 🎬 Akhiri Summit
+	print("✅ CutScene Summit selesai")
+	hideBarsSummit()
+	scam.CameraType      = Enum.CameraType.Custom
+	shumanoid.WalkSpeed  = 16
+	shumanoid.JumpHeight = 7.2
+
+	task.wait(1)
+	screenGuiSummit:Destroy()
+	
+	--Nyalakan lagi backpack gui nya
+	Backgui.Enabled = true
+	
+end)
+
+print("✅ CutScene Manager Client aktif")
