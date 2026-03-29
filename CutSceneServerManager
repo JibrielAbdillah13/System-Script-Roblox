@@ -1,0 +1,133 @@
+-- ============================================================
+-- 🖥️ SERVER SCRIPT - CutScene Manager
+-- Letakkan di: ServerScriptService
+-- ✅ Server yang load semua objek workspace (tidak kena streaming)
+-- ✅ Server yang pasang Touched (lebih reliable)
+-- ✅ Mengelola: CutScene1 (Pohon Tumbang) + CutSceneSummit (Puncak)
+-- ============================================================
+
+local Players           = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+
+
+-- ============================================================
+-- 📁 Load semua objek dari workspace di server
+-- Server tidak kena Streaming Enabled → pasti berhasil
+-- ============================================================
+-- CutScene Awal
+local amodelcam  = workspace:WaitForChild("CutSceneAwal")
+local acam1      = amodelcam:WaitForChild("camAwal")
+local atouchPart = amodelcam:WaitForChild("touchPartAwal")
+-- CutScene1
+local foldercam       = workspace:WaitForChild("CutScene1")
+local cam1            = foldercam:WaitForChild("cam1")
+local touchPart       = foldercam:WaitForChild("touchPart")
+local dustPart        = foldercam:WaitForChild("DustPart")
+local particleEmitter = dustPart:WaitForChild("Debu")
+-- CutScene Summit
+local smodelcam  = workspace:WaitForChild("CutSceneSummit")
+local scam1      = smodelcam:WaitForChild("camsummit")
+local stouchPart = smodelcam:WaitForChild("touchPartsummit")
+
+print("✅ Server: Semua objek CutScene berhasil di-load")
+
+
+-- ============================================================
+-- 📡 Buat RemoteEvents di ReplicatedStorage
+-- ============================================================
+local remoteFolder = ReplicatedStorage:FindFirstChild("CutsceneRemotes")
+if not remoteFolder then
+	remoteFolder = Instance.new("Folder")
+	remoteFolder.Name = "CutsceneRemotes"
+	remoteFolder.Parent = ReplicatedStorage
+end
+----------------
+local remoteawal = remoteFolder:FindFirstChild("StartCutSceneAwal")
+if not remoteawal then
+	remoteawal = Instance.new("RemoteEvent")
+	remoteawal.Name = "StartCutSceneAwal"
+	remoteawal.Parent = remoteFolder
+end
+local remote1 = remoteFolder:FindFirstChild("StartCutScene1")
+if not remote1 then
+	remote1 = Instance.new("RemoteEvent")
+	remote1.Name = "StartCutScene1"
+	remote1.Parent = remoteFolder
+end
+local remoteSummit = remoteFolder:FindFirstChild("StartCutSceneSummit")
+if not remoteSummit then
+	remoteSummit = Instance.new("RemoteEvent")
+	remoteSummit.Name = "StartCutSceneSummit"
+	remoteSummit.Parent = remoteFolder
+end
+
+print("✅ Server: RemoteEvents siap")
+----------------
+-- ============================================================
+-- 🎭 Debounce per-player di server (reset saat player rejoin)
+-- ============================================================
+local playerDebounceAwal   = {}
+local playerDebounce1      = {}
+local playerDebounceSummit = {}
+-- ============================================================
+
+-- 👆 SERVER pasang Touched untuk CutSceneAwal
+-- Tidak kena masalah streaming → jauh lebih reliable
+-- ============================================================
+touchPart.Touched:Connect(function(hit)
+	local hitCharacter = hit.Parent
+	local hitPlayer    = Players:GetPlayerFromCharacter(hitCharacter)
+	if not hitPlayer then return end
+
+	-- Guard debounce per-player
+	if playerDebounce1[hitPlayer.UserId] then return end
+	playerDebounce1[hitPlayer.UserId] = true
+
+	print("[Server] CutSceneAwal trigger dari: " .. hitPlayer.Name)
+
+	-- Kirim ke client beserta referensi objek yang dibutuhkan
+	remote1:FireClient(hitPlayer, acam1)
+end)
+-- 👆 SERVER pasang Touched untuk CutScene1
+-- ============================================================
+touchPart.Touched:Connect(function(hit)
+	local hitCharacter = hit.Parent
+	local hitPlayer    = Players:GetPlayerFromCharacter(hitCharacter)
+	if not hitPlayer then return end
+
+	-- Guard debounce per-player
+	if playerDebounce1[hitPlayer.UserId] then return end
+	playerDebounce1[hitPlayer.UserId] = true
+
+	print("[Server] CutScene1 trigger dari: " .. hitPlayer.Name)
+
+	-- Kirim ke client beserta referensi objek yang dibutuhkan
+	remote1:FireClient(hitPlayer, cam1, dustPart, particleEmitter)
+end)
+-- ============================================================
+-- 👆 SERVER pasang Touched untuk CutScene Summit
+-- ============================================================
+stouchPart.Touched:Connect(function(hit)
+	local hitCharacter = hit.Parent
+	local hitPlayer    = Players:GetPlayerFromCharacter(hitCharacter)
+	if not hitPlayer then return end
+
+	if playerDebounceSummit[hitPlayer.UserId] then return end
+	playerDebounceSummit[hitPlayer.UserId] = true
+
+	print("[Server] CutSceneSummit trigger dari: " .. hitPlayer.Name)
+
+	remoteSummit:FireClient(hitPlayer, scam1)
+end)
+
+-- ============================================================
+-- 🧹 Reset debounce saat player leave → siap untuk rejoin
+-- ============================================================
+Players.PlayerRemoving:Connect(function(player)
+	playerDebounce1[player.UserId]      = nil
+	playerDebounceSummit[player.UserId] = nil
+	print("[Server] Debounce direset untuk player: " .. player.Name)
+end)
+
+print("✅ CutScene Manager Server aktif & siap menerima trigger")
