@@ -1,0 +1,243 @@
+-- ShopServer.lua
+-- Taruh di: ServerScriptService
+
+local Players          = game:GetService("Players")
+local DataStoreService = game:GetService("DataStoreService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local ServerStorage    = game:GetService("ServerStorage")
+
+-- ============================================================
+-- DataStore (terpisah dari DailyLogin, tapi baca coins dari sana)
+-- ============================================================
+local ShopDataStore  = DataStoreService:GetDataStore("ShopPurchases_v1")
+local LoginDataStore = DataStoreService:GetDataStore("DailyLoginData_v1")
+
+-- ============================================================
+-- ShopConfig
+-- ============================================================
+local ShopConfig = require(ReplicatedStorage:WaitForChild("ShopConfig"))
+
+-- ============================================================
+-- Remotes
+-- ============================================================
+local function getOrCreate(parent, class, name)
+	local obj = parent:FindFirstChild(name)
+	if not obj then
+		obj = Instance.new(class)
+		obj.Name = name
+		obj.Parent = parent
+	end
+	return obj
+end
+
+local BuyRemote      = getOrCreate(ReplicatedStorage, "RemoteEvent",    "BuyShopItem")
+local OpenShopRemote = getOrCreate(ReplicatedStorage, "RemoteEvent",    "OpenShop")
+local CoinRemote     = getOrCreate(ReplicatedStorage, "RemoteEvent",    "UpdateCoin")   -- sudah ada dari DailyLogin
+local ShopDataRemote = getOrCreate(ReplicatedStorage, "RemoteFunction", "GetShopData")
+
+-- ============================================================
+-- Pastikan folder ShopItems ada di ServerStorage
+-- ============================================================
+local ShopItemsFolder = ServerStorage:FindFirstChild("ShopItems")
+if not ShopItemsFolder then
+	ShopItemsFolder = Instance.new("Folder")
+	ShopItemsFolder.Name = "ShopItems"
+	ShopItemsFolder.Parent = ServerStorage
+	warn("[ShopServer] Folder 'ShopItems' dibuat otomatis di ServerStorage. Masukkan Tool di sini!")
+end
+
+-- ============================================================
+-- Helper: Load / Save
+-- ============================================================
+local function loadLoginData(player)
+	local ok, data = pcall(function()
+		return LoginDataStore:GetAsync(tostring(player.UserId))
+	end)
+	if ok and data then return data end
+	return { coins = 0, loginDay = 0, lastLogin = 0 }
+end
+
+local function saveLoginData(player, data)
+	pcall(function()
+		LoginDataStore:SetAsync(tostring(player.UserId), data)
+	end)
+end
+
+local function loadShopData(userId)
+	local ok, data = pcall(function()
+		return ShopDataStore:GetAsync(tostring(userId))
+	end)
+	if ok and data then return data end
+	return { owned = {} }   -- owned = { [toolName] = true }
+end
+
+local function saveShopData(userId, data)
+	pcall(function()
+		ShopDataStore:SetAsync(tostring(userId), data)
+	end)
+end
+
+-- ============================================================
+-- Beri tool ke karakter pemain
+-- ============================================================
+local function giveTool(player, toolName)
+	local template = ShopItemsFolder:FindFirstChild(toolName)
+	if not template then
+		warn("[ShopServer] Tool '" .. toolName .. "' tidak ditemukan di ServerStorage > ShopItems!")
+		return false
+	end
+	local char = player.Character
+	if not char then return false end
+	local backpack = player:FindFirstChildOfClass("Backpack")
+	if not backpack then return false end
+
+	-- Cek sudah ada di backpack / karakter agar tidak dobel
+	if backpack:FindFirstChild(toolName) or char:FindFirstChild(toolName) then
+		return true  -- sudah ada, tidak perlu clone lagi
+	end
+
+	local clone = template:Clone()
+	clone.Parent = backpack
+	return true
+end
+
+-- ============================================================
+-- Restore semua tool yang sudah dibeli saat spawn
+-- ============================================================
+local playerShopCache = {}   -- cache { owned = {} } per player
+
+local function restoreTools(player)
+	local shopData = playerShopCache[player.UserId]
+	if not shopData then return end
+	for toolName, owned in pairs(shopData.owned) do
+		if owned then
+			giveTool(player, toolName)
+		end
+	end
+end
+
+-- ============================================================
+-- Player Join
+-- ============================================================
+Players.PlayerAdded:Connect(function(player)
+	local shopData = loadShopData(player.UserId)
+	playerShopCache[player.UserId] = shopData
+
+	-- Restore saat spawn / respawn
+	player.CharacterAdded:Connect(function()
+		task.wait(1)  -- tunggu karakter fully loaded
+		restoreTools(player)
+	end)
+
+	-- Jika karakter sudah ada (join terlambat load)
+	if player.Character then
+		task.wait(1)
+		restoreTools(player)
+	end
+end)
+
+-- ============================================================
+-- Player Leave → bersihkan cache
+-- ============================================================
+Players.PlayerRemoving:Connect(function(player)
+	playerShopCache[player.UserId] = nil
+end)
+
+-- ============================================================
+-- RemoteFunction: Kirim data shop + coins ke client
+-- ============================================================
+ShopDataRemote.OnServerInvoke = function(player)
+	local loginData = loadLoginData(player)
+	local shopData  = playerShopCache[player.UserId] or loadShopData(player.UserId)
+	return {
+		coins = loginData.coins,
+		owned = shopData.owned,
+		items = ShopConfig.Items,
+	}
+end
+
+-- ============================================================
+-- Beli Item
+-- ============================================================
+BuyRemote.OnServerEvent:Connect(function(player, itemId)
+	-- Validasi itemId
+	local item = nil
+	for _, v in ipairs(ShopConfig.Items) do
+		if v.id == itemId then item = v break end
+	end
+	if not item then return end
+
+	-- Load data terbaru
+	local loginData = loadLoginData(player)
+	local shopData  = playerShopCache[player.UserId] or loadShopData(player.UserId)
+
+	-- Cek sudah punya?
+	if shopData.owned[item.toolName] then
+		-- Kirim notifikasi sudah punya
+		BuyRemote:FireClient(player, { success = false, msg = "Sudah punya item ini!", coins = loginData.coins })
+		return
+	end
+
+	-- Cek saldo
+	if loginData.coins < item.price then
+		BuyRemote:FireClient(player, { success = false, msg = "Koin tidak cukup!", coins = loginData.coins })
+		return
+	end
+
+	-- Kurangi koin
+	loginData.coins = loginData.coins - item.price
+	saveLoginData(player, loginData)
+
+	-- Tandai owned
+	shopData.owned[item.toolName] = true
+	playerShopCache[player.UserId] = shopData
+	saveShopData(player.UserId, shopData)
+
+	-- Update leaderstats
+	local ls = player:FindFirstChild("leaderstats")
+	if ls then
+		local cs = ls:FindFirstChild("Coins")
+		if cs then cs.Value = loginData.coins end
+	end
+
+	-- Beri tool sekarang
+	giveTool(player, item.toolName)
+
+	-- Update UI client
+	CoinRemote:FireClient(player, loginData.coins)
+	BuyRemote:FireClient(player, {
+		success  = true,
+		msg      = "Berhasil membeli " .. item.name .. "!",
+		coins    = loginData.coins,
+		toolName = item.toolName,
+	})
+
+	print(string.format("[Shop] %s membeli '%s' seharga %d (sisa: %d koin)",
+		player.Name, item.name, item.price, loginData.coins))
+end)
+
+-- ============================================================
+-- ProxyPrompt di Part → buka shop ke player yang trigger
+-- ============================================================
+local ShopPart = workspace:FindFirstChild("ShopPart")
+if ShopPart then
+	local prompt = ShopPart:FindFirstChildOfClass("ProximityPrompt")
+	--[[
+	if not prompt then
+		prompt = Instance.new("ProximityPrompt")
+		prompt.ActionText    = "tukar koin"
+		prompt.ObjectText    = "tukar koin"
+		prompt.HoldDuration  = 0.5
+		prompt.MaxActivationDistance = 20
+		prompt.Parent = ShopPart
+	end
+	]]--
+	prompt.Triggered:Connect(function(player)
+		OpenShopRemote:FireClient(player)
+	end)
+	print("[ShopServer] ProximityPrompt terhubung ke ShopPart!")
+else
+	warn("[ShopServer] 'ShopPart' tidak ditemukan di Workspace! Buat Part bernama 'ShopPart'.")
+end
+
+print("[ShopServer] Aktif!")
