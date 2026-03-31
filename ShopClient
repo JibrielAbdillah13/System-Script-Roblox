@@ -1,0 +1,385 @@
+-- ShopClient.lua
+
+
+local Players           = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local TweenService      = game:GetService("TweenService")
+
+local player    = Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
+
+local OpenShopRemote = ReplicatedStorage:WaitForChild("OpenShop")
+local BuyRemote      = ReplicatedStorage:WaitForChild("BuyShopItem")
+local CoinRemote     = ReplicatedStorage:WaitForChild("UpdateCoin")
+local ShopDataRemote = ReplicatedStorage:WaitForChild("GetShopData")
+
+
+local IMG_COIN = "rbxassetid://87861169766396"
+
+local C = {
+	Panel    = Color3.fromRGB(135, 182, 134),
+	Card     = Color3.fromRGB(76, 159, 40),
+	CardOwn  = Color3.fromRGB(42, 56, 46),
+	Header   = Color3.fromRGB(47, 110, 46),
+	CoinBar  = Color3.fromRGB(42, 62, 43),
+	Green    = Color3.fromRGB(79, 211, 50),
+	GreenDim = Color3.fromRGB(159, 43, 43),
+	Yellow   = Color3.fromRGB(255, 195, 45),
+	White    = Color3.fromRGB(250, 250, 255),
+	Muted    = Color3.fromRGB(138, 170, 137),
+	Red      = Color3.fromRGB(195, 55, 55),
+}
+
+local currentCoins = 0
+local ownedItems   = {}
+local shopItems    = {}
+local isOpen       = false
+local panelRef, scrollRef, coinLblRef, notifRef, notifLblRef
+
+local notifQueue = {}
+local notifBusy  = false
+
+-- Format angka: 1250 → "1.250"
+local function formatNum(n)
+	return tostring(n):reverse():gsub("(%d%d%d)", "%1."):reverse():gsub("^%.", "")
+end
+
+local function corner(r, p)
+	local c = Instance.new("UICorner")
+	c.CornerRadius = UDim.new(0, r)
+	c.Parent = p
+end
+
+-- === Notifikasi ===
+local function processNotif()
+	if notifBusy or #notifQueue == 0 then return end
+	notifBusy = true
+	local entry = table.remove(notifQueue, 1)
+	notifRef.BackgroundColor3 = entry.ok and C.Green or C.Red
+	notifLblRef.Text = entry.msg
+	notifRef.Visible = true
+	notifRef.Position = UDim2.new(0.5, 0, 0, -50)
+	TweenService:Create(notifRef, TweenInfo.new(0.25), {
+		Position = UDim2.new(0.5, 0, 0, 12)
+	}):Play()
+	task.wait(2)
+	TweenService:Create(notifRef, TweenInfo.new(0.18), {
+		Position = UDim2.new(0.5, 0, 0, -50)
+	}):Play()
+	task.wait(0.2)
+	notifRef.Visible = false
+	notifBusy = false
+	processNotif()
+end
+
+local function showNotif(msg, ok)
+	table.insert(notifQueue, { msg = msg, ok = ok })
+	task.spawn(processNotif)
+end
+
+-- === Bangun GUI ===
+local function buildGui()
+	local sg = Instance.new("ScreenGui")
+	sg.Name = "ShopGui"
+	sg.ResetOnSpawn = false
+	sg.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+	sg.Parent = playerGui
+
+	-- ============================================================
+	-- SCALING — auto resize berdasarkan layar
+	-- ============================================================
+	local uiScale = sg:FindFirstChildOfClass("UIScale") or Instance.new("UIScale", sg)
+
+	-- resolusi dasar
+	local baseX, baseY = 1366, 768
+
+	-- fungsi update scale
+	local function updateScale()
+		local screenSize = workspace.CurrentCamera.ViewportSize
+		local scaleX = screenSize.X / baseX
+		local scaleY = screenSize.Y / baseY
+		local scale = math.min(scaleX, scaleY)
+
+		-- logika scaling
+		if scale < 0.5 then
+			-- layar sangat kecil (HP kecil) → perbesar agar tidak terlalu kecil
+			uiScale.Scale = scale * 1.4
+		elseif scale < 0.8 then
+			-- layar kecil-sedang (HP biasa) → tingkatkan sedikit
+			uiScale.Scale = scale * 1.2
+		elseif scale < 1 then
+			-- layar mendekati base → scaling minimal
+			uiScale.Scale = scale * 1.05
+		elseif scale > 1 then
+			-- layar lebih besar dari base → PERKECIL
+			uiScale.Scale = scale * 0.85
+		else
+			-- tepat di ukuran base
+			uiScale.Scale = 1
+		end
+	end
+
+	-- panggil pertama kali
+	updateScale()
+
+	-- update ketika layar berubah ukuran (rotate hp, resize window, dll)
+	workspace.CurrentCamera:GetPropertyChangedSignal("ViewportSize"):Connect(updateScale)
+
+	-- Notif toast
+	local notif = Instance.new("Frame")
+	notif.Size = UDim2.new(0, 260, 0, 38)
+	notif.AnchorPoint = Vector2.new(0.5, 0)
+	notif.Position = UDim2.new(0.5, 0, 0, -50)
+	notif.BackgroundColor3 = C.Green
+	notif.Visible = false
+	notif.ZIndex = 20
+	notif.Parent = sg
+	corner(8, notif)
+
+	local notifLbl = Instance.new("TextLabel")
+	notifLbl.Size = UDim2.fromScale(1, 1)
+	notifLbl.BackgroundTransparency = 1
+	notifLbl.TextColor3 = C.White
+	notifLbl.Font = Enum.Font.GothamBold
+	notifLbl.TextSize = 13
+	notifLbl.Text = ""
+	notifLbl.ZIndex = 21
+	notifLbl.Parent = notif
+
+	-- Panel utama
+	local panel = Instance.new("Frame")
+	panel.Size = UDim2.new(0, 440, 0, 430)
+	panel.AnchorPoint = Vector2.new(0.5, 0.5)
+	panel.Position = UDim2.new(0.5, 0, 0.5, 0)
+	panel.BackgroundColor3 = C.Panel
+	panel.Transparency = 0.25
+	panel.Visible = false
+	panel.ZIndex = 6
+	panel.Parent = sg
+	corner(14, panel)
+
+	-- Header
+	local header = Instance.new("Frame")
+	header.Size = UDim2.new(1, 0, 0, 44)
+	header.BackgroundColor3 = C.Header
+	header.ZIndex = 7
+	header.Parent = panel
+	corner(14, header)
+
+	-- Fix sudut bawah header biar kotak
+	local hFix = Instance.new("Frame")
+	hFix.Size = UDim2.new(1, 0, 0.5, 0)
+	hFix.AnchorPoint = Vector2.new(0, 1)
+	hFix.Position = UDim2.fromScale(0, 1)
+	hFix.BackgroundColor3 = C.Header
+	hFix.BorderSizePixel = 0
+	hFix.ZIndex = 7
+	hFix.Parent = header
+
+	local titleLbl = Instance.new("TextLabel")
+	titleLbl.Size = UDim2.new(1, -44, 1, 0)
+	titleLbl.BackgroundTransparency = 1
+	titleLbl.Text = "Item Shop"
+	titleLbl.TextColor3 = C.White
+	titleLbl.Font = Enum.Font.GothamBold
+	titleLbl.TextSize = 18
+	titleLbl.TextXAlignment = Enum.TextXAlignment.Left
+	titleLbl.ZIndex = 8
+	local tPad = Instance.new("UIPadding")
+	tPad.PaddingLeft = UDim.new(0, 16)
+	tPad.Parent = titleLbl
+	titleLbl.Parent = header
+
+	-- Tombol tutup
+	local closeBtn = Instance.new("TextButton")
+	closeBtn.Size = UDim2.new(0, 28, 0, 28)
+	closeBtn.AnchorPoint = Vector2.new(1, 0.5)
+	closeBtn.Position = UDim2.new(1, -8, 0.5, 0)
+	closeBtn.BackgroundColor3 = Color3.fromRGB(162, 24, 24)
+	closeBtn.Text = "X"
+	closeBtn.TextColor3 = C.Muted
+	closeBtn.Font = Enum.Font.FredokaOne
+	closeBtn.TextSize = 15
+	closeBtn.ZIndex = 9
+	closeBtn.Parent = header
+	corner(6, closeBtn)
+
+	-- Bar koin
+	local coinBar = Instance.new("Frame")
+	coinBar.Size = UDim2.new(1, -20, 0, 34)
+	coinBar.Position = UDim2.new(0, 10, 0, 50)
+	coinBar.BackgroundColor3 = C.CoinBar
+	coinBar.Transparency = 0.3
+	coinBar.ZIndex = 7
+	coinBar.Parent = panel
+	corner(8, coinBar)
+
+	-- Gambar koin
+	local coinImg = Instance.new("ImageLabel")
+	coinImg.Size = UDim2.new(0, 22, 0, 22)
+	coinImg.AnchorPoint = Vector2.new(0, 0.5)
+	coinImg.Position = UDim2.new(0, 10, 0.5, 0)
+	coinImg.BackgroundTransparency = 1
+	coinImg.Image = IMG_COIN
+	coinImg.ZIndex = 8
+	coinImg.Parent = coinBar
+
+	-- Label jumlah koin
+	local coinLbl = Instance.new("TextLabel")
+	coinLbl.Name = "CoinLabel"
+	coinLbl.Size = UDim2.new(1, -42, 1, 0)
+	coinLbl.Position = UDim2.new(0, 38, 0, 0)
+	coinLbl.BackgroundTransparency = 1
+	coinLbl.Text = "0"
+	coinLbl.TextColor3 = C.Yellow
+	coinLbl.Font = Enum.Font.GothamBold
+	coinLbl.TextSize = 16
+	coinLbl.TextXAlignment = Enum.TextXAlignment.Left
+	coinLbl.ZIndex = 8
+	coinLbl.Parent = coinBar
+
+	-- Area scroll
+	local scroll = Instance.new("ScrollingFrame")
+	scroll.Size = UDim2.new(1, -20, 1, -96)
+	scroll.Position = UDim2.new(0, 10, 0, 92)
+	scroll.BackgroundTransparency = 1
+	scroll.BorderSizePixel = 0
+	scroll.ScrollBarThickness = 4
+	scroll.ScrollBarImageColor3 = C.Muted
+	scroll.ScrollBarImageTransparency = 0.6
+	scroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
+	scroll.CanvasSize = UDim2.new(0, 0, 0, 0)
+	scroll.ZIndex = 7
+	scroll.Parent = panel
+
+	-- Grid layout: 3 kolom
+	local grid = Instance.new("UIGridLayout")
+	grid.CellSize = UDim2.new(0, 128, 0, 80)
+	grid.CellPadding = UDim2.new(0, 10, 0, 10)
+	grid.HorizontalAlignment = Enum.HorizontalAlignment.Center
+	grid.SortOrder = Enum.SortOrder.LayoutOrder
+	grid.Parent = scroll
+
+	local sPad = Instance.new("UIPadding")
+	sPad.PaddingTop = UDim.new(0, 4)
+	sPad.PaddingBottom = UDim.new(0, 4)
+	sPad.Parent = scroll
+
+	return panel, scroll, coinLbl, notif, notifLbl, closeBtn
+end
+
+-- === Bikin kartu item ===
+local function buildCard(parent, item, owned)
+	local card = Instance.new("Frame")
+	card.Name = "Card_" .. item.id
+	card.BackgroundColor3 = owned and C.CardOwn or C.Card
+	card.Transparency = 0.2
+	card.LayoutOrder = item.id
+	card.ZIndex = 8
+	card.Parent = parent
+	corner(10, card)
+
+	-- Nama item
+	local nameLbl = Instance.new("TextLabel")
+	nameLbl.Size = UDim2.new(1, -16, 0, 22)
+	nameLbl.Position = UDim2.new(0, 8, 0, 14)
+	nameLbl.BackgroundTransparency = 1
+	nameLbl.Text = item.name
+	nameLbl.TextColor3 = C.White
+	nameLbl.Font = Enum.Font.GothamBold
+	nameLbl.TextSize = 13
+	nameLbl.TextTruncate = Enum.TextTruncate.AtEnd
+	nameLbl.ZIndex = 9
+	nameLbl.Parent = card
+
+	-- Tombol beli / status
+	local btn = Instance.new("TextButton")
+	btn.Name = "BuyBtn"
+	btn.Size = UDim2.new(1, -16, 0, 28)
+	btn.Position = UDim2.new(0, 8, 1, -40)
+	btn.Font = Enum.Font.GothamBold
+	btn.TextSize = 12
+	btn.ZIndex = 9
+	btn.Parent = card
+	corner(6, btn)
+
+	if owned then
+		btn.BackgroundColor3 = C.GreenDim
+		btn.TextColor3 = Color3.fromRGB(140, 200, 140)
+		btn.Text = "Dimiliki"
+		btn.AutoButtonColor = false
+	else
+		btn.BackgroundColor3 = C.Green
+		btn.TextColor3 = Color3.fromRGB(0, 0, 0)
+		btn.Text = formatNum(item.price)
+		btn.MouseButton1Click:Connect(function()
+			BuyRemote:FireServer(item.id)
+		end)
+	end
+end
+
+-- === Refresh seluruh kartu ===
+local function refreshCards()
+	for _, v in ipairs(scrollRef:GetChildren()) do
+		if v:IsA("Frame") then v:Destroy() end
+	end
+	for _, item in ipairs(shopItems) do
+		buildCard(scrollRef, item, ownedItems[item.toolName] == true)
+	end
+	coinLblRef.Text = formatNum(currentCoins)
+end
+
+-- === Buka / Tutup ===
+local function openShop()
+	if isOpen then return end
+	isOpen = true
+	local data = ShopDataRemote:InvokeServer()
+	currentCoins = data.coins
+	ownedItems   = data.owned
+	shopItems    = data.items
+	panelRef.Size = UDim2.new(0, 440, 0, 0)
+	panelRef.Visible = true
+	TweenService:Create(panelRef, TweenInfo.new(0.28, Enum.EasingStyle.Back, Enum.EasingDirection.Out), {
+		Size = UDim2.new(0, 440, 0, 430)
+	}):Play()
+	refreshCards()
+end
+
+local function closeShop()
+	if not isOpen then return end
+	TweenService:Create(panelRef, TweenInfo.new(0.15, Enum.EasingStyle.Quad, Enum.EasingDirection.In), {
+		Size = UDim2.new(0, 440, 0, 0)
+	}):Play()
+	task.wait(0.17)
+	panelRef.Visible = false
+	isOpen = false
+end
+
+-- === Init ===
+local panel, scroll, coinLbl, notif, notifLbl, closeBtn = buildGui()
+panelRef    = panel
+scrollRef   = scroll
+coinLblRef  = coinLbl
+notifRef    = notif
+notifLblRef = notifLbl
+
+closeBtn.MouseButton1Click:Connect(closeShop)
+OpenShopRemote.OnClientEvent:Connect(openShop)
+
+BuyRemote.OnClientEvent:Connect(function(result)
+	if result.success then
+		currentCoins = result.coins
+		ownedItems[result.toolName] = true
+		showNotif(result.msg, true)
+	else
+		showNotif(result.msg, false)
+	end
+	refreshCards()
+end)
+
+CoinRemote.OnClientEvent:Connect(function(coins)
+	currentCoins = coins
+	coinLblRef.Text = formatNum(currentCoins)
+end)
+
+print("[ShopClient] Aktif!")
