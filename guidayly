@@ -1,0 +1,643 @@
+-- DailyLoginClient.lua
+-- Taruh di: StarterPlayerScripts
+
+local Players           = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local TweenService      = game:GetService("TweenService")
+
+local player    = Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
+
+-- ============================================================
+-- ASSET ID
+-- ============================================================
+local COIN_IMAGE_ID  = "rbxassetid://110875281918299"
+local CHECK_IMAGE_ID = "rbxassetid://98426348783775"
+local LOCK_IMAGE_ID  = "rbxassetid://100098110099284"
+
+local DAILY_REWARDS = {5, 10, 25, 50, 75, 100, 200}
+
+local RESET_SECONDS = 10
+
+-- ============================================================
+-- WARNA TEMA
+-- ============================================================
+local PURPLE_DARK   = Color3.fromRGB(45,  20,  80)
+local PURPLE_MID    = Color3.fromRGB(90,  50,  160)
+local GOLD_BRIGHT   = Color3.fromRGB(28, 89, 30)
+local GOLD_DARK     = Color3.fromRGB(180, 130, 20)
+local CARD_BG       = Color3.fromRGB(230, 210, 170)
+local CARD_DONE_BG  = Color3.fromRGB(195, 230, 175)
+local CARD_DONE_HDR = Color3.fromRGB(70,  160, 70)
+local CARD_ACT_BG   = Color3.fromRGB(200, 240, 155)
+local CARD_ACT_HDR  = Color3.fromRGB(100, 190, 100)
+local PANEL_BG      = Color3.fromRGB(198, 245, 199)
+local WHITE         = Color3.fromRGB(255, 255, 255)
+
+local CoinRemote    = ReplicatedStorage:WaitForChild("UpdateCoin",      10)
+local LoginRemote   = ReplicatedStorage:WaitForChild("ShowLoginReward", 10)
+local ClaimRemote   = ReplicatedStorage:WaitForChild("ClaimReward",     10)
+local RequestRemote = ReplicatedStorage:WaitForChild("GetLoginData",    10)
+
+-- ============================================================
+-- ScreenGui
+-- ============================================================
+local screenGui          = Instance.new("ScreenGui")
+screenGui.Name           = "DailyLoginGui"
+screenGui.ResetOnSpawn   = false
+screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+screenGui.Parent         = playerGui
+
+-- ============================================================
+-- SCALING — auto resize berdasarkan layar
+-- ============================================================
+local uiScale = screenGui:FindFirstChildOfClass("UIScale") or Instance.new("UIScale", screenGui)
+
+-- resolusi dasar
+local baseX, baseY = 1366, 768
+
+-- fungsi update scale
+local function updateScale()
+	local screenSize = workspace.CurrentCamera.ViewportSize
+	local scaleX = screenSize.X / baseX
+	local scaleY = screenSize.Y / baseY
+	local scale = math.min(scaleX, scaleY)
+
+	-- logika scaling
+	if scale < 0.5 then
+		-- layar sangat kecil (HP kecil) → perbesar agar tidak terlalu kecil
+		uiScale.Scale = scale * 1.4
+	elseif scale < 0.8 then
+		-- layar kecil-sedang (HP biasa) → tingkatkan sedikit
+		uiScale.Scale = scale * 1.2
+	elseif scale < 1 then
+		-- layar mendekati base → scaling minimal
+		uiScale.Scale = scale * 1.05
+	elseif scale > 1 then
+		-- layar lebih besar dari base → PERKECIL
+		uiScale.Scale = scale * 0.85
+	else
+		-- tepat di ukuran base
+		uiScale.Scale = 1
+	end
+end
+
+-- panggil pertama kali
+updateScale()
+
+-- update ketika layar berubah ukuran (rotate hp, resize window, dll)
+workspace.CurrentCamera:GetPropertyChangedSignal("ViewportSize"):Connect(updateScale)
+
+-- ============================================================
+-- HUD COIN — pojok kanan atas
+-- ============================================================
+local coinFrame            = Instance.new("Frame", screenGui)
+coinFrame.Size             = UDim2.new(0, 120, 0, 36)
+coinFrame.Position         = UDim2.new(1, -134, 0, 12)
+coinFrame.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+coinFrame.BackgroundTransparency = 0.2
+coinFrame.BorderSizePixel  = 0
+Instance.new("UICorner", coinFrame).CornerRadius = UDim.new(0, 8)
+local hudStroke            = Instance.new("UIStroke", coinFrame)
+hudStroke.Color            = Color3.fromRGB(50, 255, 50)
+hudStroke.Thickness        = 1.5
+
+local coinIcon             = Instance.new("ImageLabel", coinFrame)
+coinIcon.Size              = UDim2.new(0, 28, 0, 28)
+coinIcon.Position          = UDim2.new(0, 5, 0.5, -14)
+coinIcon.BackgroundTransparency = 1
+coinIcon.Image             = COIN_IMAGE_ID
+coinIcon.ScaleType         = Enum.ScaleType.Fit
+
+local coinLabel            = Instance.new("TextLabel", coinFrame)
+coinLabel.Size             = UDim2.new(1, -38, 1, 0)
+coinLabel.Position         = UDim2.new(0, 36, 0, 0)
+coinLabel.BackgroundTransparency = 1
+coinLabel.Text             = "0"
+coinLabel.TextColor3       = CARD_ACT_HDR
+coinLabel.TextScaled       = true
+coinLabel.Font             = Enum.Font.GothamBold
+coinLabel.TextXAlignment   = Enum.TextXAlignment.Left
+
+local function updateCoinDisplay(amount)
+	coinLabel.Text = tostring(amount)
+	local tIn  = TweenService:Create(coinFrame, TweenInfo.new(0.1),  {Size = UDim2.new(0, 130, 0, 42)})
+	local tOut = TweenService:Create(coinFrame, TweenInfo.new(0.15), {Size = UDim2.new(0, 120, 0, 36)})
+	tIn:Play()
+	tIn.Completed:Once(function() tOut:Play() end)
+end
+
+-- ============================================================
+-- NOTIF BAR — hanya teks, tanpa icon koin
+-- ============================================================
+local notifFrame            = Instance.new("Frame", screenGui)
+notifFrame.Name             = "NotifBar"
+notifFrame.Size             = UDim2.new(0, 300, 0, 50)
+notifFrame.Position         = UDim2.new(0.385, 0, 0, -40)
+notifFrame.BackgroundColor3 = PURPLE_MID
+notifFrame.BackgroundTransparency = 0  -- <-- DITAMBAH
+notifFrame.BorderSizePixel  = 0
+notifFrame.Visible          = false
+Instance.new("UICorner", notifFrame).CornerRadius = UDim.new(0, 10)
+
+-- Hanya TextLabel, tidak ada ImageLabel koin
+local notifText             = Instance.new("TextLabel", notifFrame)
+notifText.Size              = UDim2.new(1, -16, 1, 0)
+notifText.Position          = UDim2.new(0, 8, 0, 0)
+notifText.BackgroundTransparency = 1
+notifText.TextColor3        = WHITE
+notifText.TextScaled        = true
+notifText.Font              = Enum.Font.GothamBold
+notifText.TextXAlignment    = Enum.TextXAlignment.Center
+
+local activeTween = nil
+
+local function showNotif(msg)
+	if activeTween then activeTween:Cancel() end
+	notifText.Text      = msg
+	notifFrame.Visible  = true
+	notifFrame.Position = UDim2.new(0.430, 0, 0, -40)
+
+	TweenService:Create(notifFrame,
+		TweenInfo.new(0.3, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+		{Position = UDim2.new(0.430, 0, 0, -14)}):Play()
+
+	task.delay(2.5, function()
+		activeTween = TweenService:Create(notifFrame,
+			TweenInfo.new(0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.In),
+			{Position = UDim2.new(0.430, 0, 0, -40)})
+		activeTween:Play()
+		activeTween.Completed:Once(function()
+			notifFrame.Visible = false
+		end)
+	end)
+end
+
+-- ============================================================
+-- LAYOUT KONSTANTA — sesuai screenshot
+--
+--   [ Day1 ][ Day2 ][ Day3 ][ Day 7  ]
+--   [ Day4 ][ Day5 ][ Day6 ][        ]
+--   [     Klaim +100 Koin (full lebar)]
+--
+-- Koin: mendominasi ruang kartu, hampir penuh lebar
+-- Teks xN: kiri bawah kartu
+-- Ceklis/Kunci: kanan bawah kartu
+-- Tombol: full lebar panel
+-- ============================================================
+local PAD    = 12   -- padding panel kiri & kanan
+local GAP    = 6    -- gap antar kartu kecil
+local GAP2   = 8    -- gap antara grup kartu kecil & Day7
+
+-- Kartu kecil
+local CW     = 78   -- lebar
+local CH     = 108  -- tinggi
+local HDR_H  = 24   -- tinggi header
+
+-- Kartu Day 7
+local BW     = 108  -- lebar
+local BH     = CH * 2 + GAP  -- tinggi = 222
+
+-- Icon koin: hampir penuh lebar kartu (lebar - 8px sisi kiri-kanan)
+local COIN_SM = CW - 10   -- 68px untuk kartu kecil
+local COIN_BG = BW - 16   -- 92px untuk kartu Day7
+
+-- Badge ceklis / kunci: kanan bawah
+local BADGE_SM = 50
+local BADGE_BG = 70
+
+-- Reward text font size
+local RTXT_SM = 13
+local RTXT_BG = 15
+
+-- Panel lebar dihitung otomatis
+local PANEL_W = PAD + 3*(CW + GAP) - GAP + GAP2 + BW + PAD
+
+local RIB_H   = 46
+local SUB_H   = 20
+local START_Y = RIB_H + SUB_H + 8   -- 74
+local BTN_H   = 36
+local BTN_GAP = 8
+local PANEL_H = START_Y + BH + BTN_GAP + BTN_H + 10
+
+-- ============================================================
+-- OVERLAY + PANEL
+-- ============================================================
+local panel                = Instance.new("Frame", screenGui)
+panel.Size                 = UDim2.new(0, PANEL_W, 0, PANEL_H)
+panel.Position             = UDim2.new(0.5, -PANEL_W/2, 0.5, -PANEL_H/2)
+panel.BackgroundColor3     = PANEL_BG
+panel.Transparency         = 0.4
+panel.BorderSizePixel      = 0
+Instance.new("UICorner", panel).CornerRadius = UDim.new(0, 16)
+local panelStroke          = Instance.new("UIStroke", panel)
+panelStroke.Color          = GOLD_BRIGHT
+panelStroke.Thickness      = 3
+
+-- Ribbon ungu atas
+local ribbon               = Instance.new("Frame", panel)
+ribbon.Size                = UDim2.new(1, 40, 0, RIB_H)
+ribbon.Position            = UDim2.new(0, -20, 0, -10)
+ribbon.BackgroundColor3    = PURPLE_MID
+ribbon.BorderSizePixel     = 0
+ribbon.ZIndex              = 2
+Instance.new("UICorner", ribbon).CornerRadius = UDim.new(0, 10)
+Instance.new("UIStroke", ribbon).Color        = GOLD_BRIGHT
+
+local titleLabel           = Instance.new("TextLabel", ribbon)
+titleLabel.Size            = UDim2.new(1, 0, 1, 0)
+titleLabel.BackgroundTransparency = 1
+titleLabel.Text            = "Daily Reward"
+titleLabel.TextColor3      = WHITE
+titleLabel.TextSize        = 22
+titleLabel.Font            = Enum.Font.GothamBold
+titleLabel.ZIndex          = 3
+
+--[[
+local gradientd            = Instance.new("UIGradient", ribbon)
+gradientd.Color           = ColorSequence.new({
+	ColorSequenceKeypoint.new(0, Color3.fromRGB(90, 50, 160)),
+	ColorSequenceKeypoint.new(0.5, Color3.fromRGB(153, 40, 245)),
+	ColorSequenceKeypoint.new(1, Color3.fromRGB(90, 50, 160))
+})
+gradientd.Rotation        = 90
+gradientd.Transparency = 0.5
+]]--
+
+-- Tombol X
+local closeBtn             = Instance.new("TextButton", panel)
+closeBtn.Size              = UDim2.new(0, 28, 0, 28)
+closeBtn.Position          = UDim2.new(1, -12, 0, 0.5)
+closeBtn.BackgroundColor3  = Color3.fromRGB(149, 20, 20)
+closeBtn.BorderSizePixel   = 0
+closeBtn.Text              = "X"
+closeBtn.TextColor3        = Color3.fromRGB(227, 37, 37)
+closeBtn.TextSize          = 15
+closeBtn.Font              = Enum.Font.FredokaOne
+closeBtn.ZIndex            = 10
+closeBtn.BackgroundTransparency = 1
+
+
+-- Sub judul
+local subLabel             = Instance.new("TextLabel", panel)
+subLabel.Size              = UDim2.new(1, 0, 0, SUB_H)
+subLabel.Position          = UDim2.new(0, 0, 0, RIB_H - 2)
+subLabel.BackgroundTransparency = 1
+subLabel.Text              = "Main setiap hari untuk bonus tambahan!"
+subLabel.TextColor3        = Color3.fromRGB(185, 15, 15)
+subLabel.TextSize          = 13
+subLabel.Font              = Enum.Font.GothamBold
+
+-- ============================================================
+-- BUAT KARTU HARI
+-- ============================================================
+local dayCards = {}
+
+local function makeCard(dayIndex, posX, posY, w, h)
+	local isBig   = (w > CW)
+	local hdrH    = isBig and 28 or HDR_H
+	local iconSz  = isBig and COIN_BG or COIN_SM
+	local badgeSz = isBig and BADGE_BG or BADGE_SM
+	local rSz     = isBig and RTXT_BG or RTXT_SM
+
+	-- Frame kartu
+	local card             = Instance.new("Frame", panel)
+	card.Name              = "DayCard"..dayIndex
+	card.Size              = UDim2.new(0, w, 0, h)
+	card.Position          = UDim2.new(0, posX, 0, posY)
+	card.BackgroundColor3  = CARD_BG
+	card.BorderSizePixel   = 0
+	Instance.new("UICorner", card).CornerRadius = UDim.new(0, 10)
+	local cardS            = Instance.new("UIStroke", card)
+	cardS.Thickness        = 1.5
+	cardS.Color            = GOLD_DARK
+
+	-- Header "Day N"
+	local hdr              = Instance.new("Frame", card)
+	hdr.Size               = UDim2.new(1, 0, 0, hdrH)
+	hdr.BackgroundColor3   = PURPLE_MID
+	hdr.BorderSizePixel    = 0
+	Instance.new("UICorner", hdr).CornerRadius = UDim.new(0, 10)
+	local hPatch           = Instance.new("Frame", hdr)
+	hPatch.Size            = UDim2.new(1, 0, 0, 12)
+	hPatch.Position        = UDim2.new(0, 0, 1, -12)
+	hPatch.BackgroundColor3 = PURPLE_MID
+	hPatch.BorderSizePixel  = 0
+
+	local hTxt             = Instance.new("TextLabel", hdr)
+	hTxt.Size              = UDim2.new(1, 0, 1, 0)
+	hTxt.BackgroundTransparency = 1
+	hTxt.Text              = "Day "..dayIndex
+	hTxt.TextColor3        = WHITE
+	hTxt.TextSize          = isBig and 16 or 14
+	hTxt.Font              = Enum.Font.GothamBold
+
+	-- Koin: tengah horizontal, tengah vertikal antara header & bawah kartu
+	-- Sisa ruang vertikal di bawah header (dikurangi area bawah untuk teks+badge)
+	local bottomAreaH = rSz + 10   -- tinggi area teks reward di bawah
+	local midAreaTop  = hdrH + 4
+	local midAreaH    = h - midAreaTop - bottomAreaH
+	local coinOffY    = midAreaTop + math.floor((midAreaH - iconSz) / 2)
+	if coinOffY < midAreaTop then coinOffY = midAreaTop end
+
+	local coinImg          = Instance.new("ImageLabel", card)
+	coinImg.Size           = UDim2.new(0, iconSz, 0, iconSz)
+	coinImg.Position       = UDim2.new(0.5, -iconSz/2, 0, coinOffY)
+	coinImg.BackgroundTransparency = 1
+	coinImg.Image          = COIN_IMAGE_ID
+	coinImg.ScaleType      = Enum.ScaleType.Fit
+
+	-- Teks "xN" — kiri bawah
+	local rewardTxt        = Instance.new("TextLabel", card)
+	rewardTxt.Size         = UDim2.new(0, w - badgeSz - 10, 0, rSz + 2)
+	rewardTxt.Position     = UDim2.new(0, 5, 1, -(rSz + 6))
+	rewardTxt.BackgroundTransparency = 1
+	rewardTxt.Text         = "x"..DAILY_REWARDS[dayIndex]
+	rewardTxt.TextColor3   = Color3.fromRGB(40, 25, 5)
+	rewardTxt.TextSize     = rSz
+	rewardTxt.Font         = Enum.Font.GothamBold
+	rewardTxt.TextXAlignment = Enum.TextXAlignment.Left --default left
+
+	-- Ceklis — kanan bawah
+	local checkImg         = Instance.new("ImageLabel", card)
+	checkImg.Name          = "CheckImg"
+	checkImg.Size          = UDim2.new(0, badgeSz, 0, badgeSz)
+	checkImg.Position      = UDim2.new(1, -(badgeSz - 14), 1, -(badgeSz - 14))
+	checkImg.BackgroundTransparency = 1
+	checkImg.Image         = CHECK_IMAGE_ID
+	checkImg.ScaleType     = Enum.ScaleType.Fit
+	checkImg.ZIndex        = 5
+	checkImg.Visible       = false
+
+	-- Kunci — kanan bawah
+	local lockImg          = Instance.new("ImageLabel", card)
+	lockImg.Name           = "LockImg"
+	lockImg.Size           = UDim2.new(0, badgeSz, 0, badgeSz)
+	lockImg.Position       = UDim2.new(1, -(badgeSz - 14), 1, -(badgeSz - 14))
+	lockImg.BackgroundTransparency = 1
+	lockImg.Image          = LOCK_IMAGE_ID
+	lockImg.ScaleType      = Enum.ScaleType.Fit
+	lockImg.ZIndex         = 5
+	lockImg.Visible        = false
+
+	dayCards[dayIndex] = {
+		card   = card,
+		stroke = cardS,
+		hdr    = hdr,
+		hPatch = hPatch,
+		check  = checkImg,
+		lock   = lockImg,
+	}
+end
+
+-- ============================================================
+-- Susun posisi kartu
+-- ============================================================
+for col = 0, 2 do
+	local x = PAD + col * (CW + GAP)
+	makeCard(col + 1, x, START_Y,            CW, CH)
+	makeCard(col + 4, x, START_Y + CH + GAP, CW, CH)
+end
+
+local day7X = PAD + 3 * (CW + GAP) - GAP + GAP2
+makeCard(7, day7X, START_Y, BW, BH)
+
+-- ============================================================
+-- Tombol Klaim — FULL LEBAR (sesuai screenshot)
+-- ============================================================
+local btnW  = PANEL_W - PAD * 2
+local btnY  = START_Y + BH + BTN_GAP
+
+local claimBtn             = Instance.new("TextButton", panel)
+claimBtn.Name              = "ClaimBtn"
+claimBtn.Size              = UDim2.new(0, btnW, 0, BTN_H)
+claimBtn.Position          = UDim2.new(0, PAD, 0, btnY)
+claimBtn.BackgroundColor3  = CARD_ACT_HDR
+claimBtn.BorderSizePixel   = 0
+claimBtn.Text              = "Klaim Reward"
+claimBtn.TextColor3        = WHITE
+claimBtn.TextSize          = 14
+claimBtn.Font              = Enum.Font.GothamBold
+Instance.new("UICorner", claimBtn).CornerRadius = UDim.new(0, 10)
+local btnStroke            = Instance.new("UIStroke", claimBtn)
+btnStroke.Color            = GOLD_BRIGHT
+btnStroke.Thickness        = 2
+-- ============================================================
+
+local countdownThread = nil -- track coroutine countdown
+
+local function stopCountdown()
+	if countdownThread and countdownThread ~= coroutine.running() then
+		task.cancel(countdownThread)
+	end
+	countdownThread = nil
+end
+
+local function startCountdown(lastLoginTime)
+	stopCountdown() -- stop countdown lama kalau ada
+
+	countdownThread = task.spawn(function()
+		while true do
+			local elapsed   = os.time() - lastLoginTime
+			local remaining = RESET_SECONDS - elapsed -- RESET_SECONDS dari server = 86400
+
+			if remaining <= 0 then
+				-- Waktunya habis, tombol bisa klaim lagi
+				claimBtn.Active           = true
+				claimBtn.BackgroundColor3 = CARD_ACT_HDR
+				claimBtn.Text             = "Klaim Reward"
+				btnStroke.Color           = GOLD_BRIGHT
+				stopCountdown()
+				break
+			end
+
+			local jam    = math.floor(remaining / 3600)
+			local menit  = math.floor((remaining % 3600) / 60)
+			local detik  = remaining % 60
+
+			claimBtn.Text = string.format(
+				"✓ Sudah Diklaim, Tunggu %d Jam %d Menit %d Detik",
+				jam, menit, detik
+			)
+
+			task.wait(1)
+		end
+	end)
+end
+
+
+
+-- ============================================================
+-- Update warna & icon kartu
+-- ============================================================
+local function setCardState(info, state)
+	local card   = info.card
+	local hdr    = info.hdr
+	local hPatch = info.hPatch
+	local stroke = info.stroke
+	local check  = info.check
+	local lock   = info.lock
+
+	check.Visible = false
+	lock.Visible  = false
+
+	if state == "done" then
+		card.BackgroundColor3   = CARD_DONE_BG
+		hdr.BackgroundColor3    = CARD_DONE_HDR
+		hPatch.BackgroundColor3 = CARD_DONE_HDR
+		stroke.Color            = Color3.fromRGB(80, 180, 80)
+		stroke.Thickness        = 1.5
+		check.Visible           = true
+
+	elseif state == "active" then
+		card.BackgroundColor3   = CARD_ACT_BG
+		hdr.BackgroundColor3    = CARD_ACT_HDR
+		hPatch.BackgroundColor3 = CARD_ACT_HDR
+		stroke.Color            = CARD_ACT_HDR
+		stroke.Thickness        = 2.5
+
+	else -- "locked"
+		card.BackgroundColor3   = CARD_BG
+		hdr.BackgroundColor3    = PURPLE_MID
+		hPatch.BackgroundColor3 = PURPLE_MID
+		stroke.Color            = GOLD_DARK
+		stroke.Thickness        = 1.5
+		lock.Visible            = true
+	end
+end
+
+local function updateDayCards(currentDay, canClaim)
+	for i, info in ipairs(dayCards) do
+		if i < currentDay then
+			setCardState(info, "done")
+		elseif i == currentDay then
+			setCardState(info, canClaim and "active" or "done")
+		else
+			setCardState(info, "locked")
+		end
+	end
+end
+
+-- ============================================================
+-- Tampilkan / sembunyikan panel
+-- ============================================================
+local currentData = nil
+
+local function showLoginPanel(data)
+	updateDayCards(data.currentDay, data.canClaim)
+	if data.canClaim then
+		claimBtn.BackgroundColor3 = CARD_ACT_HDR
+		claimBtn.Text             = "Klaim  +" .. DAILY_REWARDS[data.currentDay] .. " Koin"
+		claimBtn.Active           = true
+		btnStroke.Color           = GOLD_BRIGHT
+	else
+		claimBtn.BackgroundColor3 = Color3.fromRGB(100, 150, 100)
+		claimBtn.Text             = "✓  Sudah Diklaim Hari Ini"
+		claimBtn.Active           = false
+		btnStroke.Color           = Color3.fromRGB(80, 140, 80)
+	end
+
+end
+
+local function hidePanel()
+	panel.Visible = false
+end
+
+--Fungsi untuk melihat panel
+local guinya = playerGui:WaitForChild("ScreenGui")
+local tombol = guinya:WaitForChild("TextButton")
+
+tombol.MouseButton1Click:Connect(function()
+	panel.Visible = not panel.Visible
+end)
+
+
+-- ============================================================
+-- Events dari server
+-- ============================================================
+LoginRemote.OnClientEvent:Connect(function(data)
+	currentData = data
+	updateCoinDisplay(data.coins)
+
+	if data.justClaimed then
+		-- Update kartu: hari yang baru diklaim → "done"
+		updateDayCards(data.currentDay, false)
+
+		-- Update tombol klaim langsung
+		claimBtn.BackgroundColor3 = Color3.fromRGB(62, 93, 62)
+		--claimBtn.Text             = "✓  Sudah Diklaim Hari Ini"
+		claimBtn.Active           = false
+		btnStroke.Color           = Color3.fromRGB(80, 140, 80)
+		
+		-- Mulai countdown setelah klaim
+		if data.lastLogin then
+			startCountdown(data.lastLogin)
+		end
+		
+	else
+		showLoginPanel(data)
+		-- Kalau sudah diklaim sebelumnya, langsung jalankan countdown
+		if not data.canClaim and data.lastLogin then
+			startCountdown(data.lastLogin)
+		end
+		
+	end
+end)
+
+CoinRemote.OnClientEvent:Connect(function(amount)
+	updateCoinDisplay(amount)
+end)
+
+-- [ SOUND KLAIM ]
+local claimSound = Instance.new("Sound")
+claimSound.SoundId = "rbxassetid://97288561742143" -- suara koin/reward
+claimSound.Volume = 0.8
+claimSound.Parent = game:GetService("SoundService")
+
+-- ============================================================
+-- Tombol Klaim
+-- ============================================================
+claimBtn.MouseButton1Click:Connect(function()
+	if not claimBtn.Active then return end
+
+	local reward = 0
+	if currentData then
+		reward = DAILY_REWARDS[currentData.currentDay] or 0
+	end
+	
+	claimSound:Play() -- play sound efek
+	
+	-- Langsung disable tombol supaya tidak bisa klik 2x
+	claimBtn.Active           = false
+	claimBtn.BackgroundColor3 = Color3.fromRGB(100, 150, 100)
+	claimBtn.Text             = "⏳ Mengklaim..."
+
+	showNotif("  +" .. reward .. " Koin diklaim!")
+	ClaimRemote:FireServer()
+	-- Server akan reply via LoginRemote → update kartu & tombol final
+end)
+
+-- [ SOUND CLOSE ]
+local closeSound = Instance.new("Sound")
+closeSound.SoundId = "rbxassetid://88300665572065" -- Login Besok lagi yak!! or Besok, login lagi ya!!
+closeSound.Volume = 0.8
+closeSound.Parent = game:GetService("SoundService")
+
+closeBtn.MouseButton1Click:Connect(function()
+	hidePanel()
+	closeSound:Play()
+end)
+
+-- ============================================================
+-- Init
+-- ============================================================
+task.wait(1)
+local ok, initData = pcall(function()
+	return RequestRemote:InvokeServer()
+end)
+if ok and initData then
+	currentData = initData
+	updateCoinDisplay(initData.coins)
+end
+
+print("[DailyLoginClient] Aktif!")
