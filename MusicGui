@@ -1,0 +1,823 @@
+-- LocalScript (StarterPlayerScripts)
+local Players           = game:GetService("Players")
+local SoundService      = game:GetService("SoundService")
+local UserInputService  = game:GetService("UserInputService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService        = game:GetService("RunService")
+
+local player    = Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
+
+-- ============================================================
+-- DECAL ID TOMBOL KONTROL
+-- ============================================================
+local Icons = {
+	shuffle = "rbxassetid://94476355052504",
+	prev    = "rbxassetid://95422316797236",
+	play    = "rbxassetid://83867416087692",
+	pause   = "rbxassetid://100212041222192",
+	next    = "rbxassetid://118957684302554",
+	loop    = "rbxassetid://123656906131594",
+}
+
+-- ============================================================
+-- DISINI BUAT GANTI GAMBAR ICON MUSIK NYA BG
+-- ============================================================
+local COVER_IMAGE = "rbxassetid://115251004973451"
+
+-- ============================================================
+-- PLAYLIST NYA ISI DENGAN MUSIK ID YANG PUNYA
+-- ============================================================
+local Playlists = {
+	Trend = {
+		{ name = "Mount Daives 1",   id = 112889751127441 },
+		{ name = "Ngapain Repot",    id = 84316271180655 },
+		{ name = "Tor Monitor",      id = 95282218661930 },
+		{ name = "Kasih Tau Mama",   id = 77107733584067 },
+		{ name = "Tabola Bale",      id = 99859085817969 },
+		{ name = "Puting Beliung",   id = 129886645093878 },
+		{ name = "Alamak",           id = 71176421714072 },
+		{ name = "Better When",      id = 110851567816043 },
+		{ name = "Marsha and Bear",  id = 95871690841222 },
+		{ name = "Asmalibrasi",      id = 81377809757269 },
+	},
+	DJ = {
+		{ name = "DJ Jan Bodong",    id = 137484750615434 },
+		{ name = "DJ Aku Suges",     id = 94540911110579 },
+		{ name = "DJ Eynobigbang",   id = 124306059794587 },
+		{ name = "DJ Kawenemeri",    id = 123306135428337 },
+		{ name = "DJ Kentut",        id = 91808988537010 },
+	},
+	Koplo = {
+		{ name = "Mejikuhibiniu",    id = 97166525350188 },
+		{ name = "Putri Iklan",      id = 86553492036589 },
+		{ name = "Tabola Bale",      id = 139234933943826 },
+		{ name = "Ngapain Mo Repot", id = 86519868607871 },
+		{ name = "Tarot",            id = 120886729299723 },
+		{ name = "Merindu Lagi",     id = 112257180690683 },
+		{ name = "Tor Monitor",      id = 92095242668071 },
+	},
+	Galau = {
+		{ name = "Amin Paling Serius",  id = 111158306231086 },
+		{ name = "Apa Mungkin",         id = 129986223983425 },
+		{ name = "Kota Ini Tak Sama",   id = 125754203152791 },
+		{ name = "Bersamamu",           id = 121043294272576 },
+		{ name = "Somebody Pleasure",   id = 77243285577572 },
+		{ name = "When i was your man", id = 139187494728061 },
+		{ name = "Penjaga Hati",        id = 122940601650454 },
+		{ name = "Bergema Selamanya",   id = 128166379337704 },
+		{ name = "Line With a Hook",    id = 72987314561733 },
+		{ name = "Windflower",          id = 77340609395486 },
+		{ name = "Blue",                id = 113808899433488 },
+		{ name = "Mangu",               id = 97729576108417 },
+		{ name = "Multo",               id = 107253144862644 },
+	},
+}
+
+-- ============================================================
+-- STATE
+-- ============================================================
+local State = {
+	genre         = "Trend",
+	index         = 1,
+	playing       = false,
+	looping       = false,
+	playlist      = false,
+	sound         = nil,
+	volume        = 0.5,
+	dragging      = false,
+	playingGenre  = nil,
+	playingIndex  = nil,
+}
+
+-- ============================================================
+-- WARNA
+-- ============================================================
+local C = {
+	white  = Color3.fromRGB(255, 255, 255),
+	black  = Color3.fromRGB(0,   0,   0),
+	green  = Color3.fromRGB(30,  160,  30),
+	greenD = Color3.fromRGB(15,  100,  15),
+	greenL = Color3.fromRGB(80,  200,  80),
+	panel  = Color3.fromRGB(235, 250, 235),
+	red    = Color3.fromRGB(180,  35,  35),
+	gray   = Color3.fromRGB(160, 160, 160),
+}
+
+-- ============================================================
+-- HELPER
+-- ============================================================
+local function mkFrame(parent, size, pos, bg, bgTrans, zIdx, radius)
+	local f = Instance.new("Frame")
+	f.Size = size ; f.Position = pos
+	f.BackgroundColor3 = bg ; f.BackgroundTransparency = bgTrans
+	f.BorderSizePixel = 0 ; f.ZIndex = zIdx ; f.Parent = parent
+	Instance.new("UICorner", f).CornerRadius = UDim.new(0, radius or 0)
+	return f
+end
+
+local function mkStroke(parent, color, thick, trans)
+	local s = Instance.new("UIStroke", parent)
+	s.Color = color ; s.Thickness = thick ; s.Transparency = trans or 0
+	return s
+end
+
+local function formatTime(secs)
+	if secs ~= secs or secs < 0 then secs = 0 end
+	local s = math.floor(secs)
+	return string.format("%02d:%02d", math.floor(s / 60), s % 60)
+end
+
+-- ============================================================
+-- GUI ROOT
+-- ============================================================
+local Gui = Instance.new("ScreenGui")
+Gui.Name           = "BoomboxGUI"
+Gui.ResetOnSpawn   = false
+Gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+Gui.IgnoreGuiInset = true
+Gui.Parent         = playerGui
+
+-- ============================================================
+-- UI SCALE - RESPONSIVE
+-- ============================================================
+local uiScale      = Instance.new("UIScale", Gui)
+local baseX, baseY = 1366, 768
+
+local function updateScale()
+	local screenSize = workspace.CurrentCamera.ViewportSize
+	local scaleX = screenSize.X / baseX
+	local scaleY = screenSize.Y / baseY
+	local scale  = math.min(scaleX, scaleY)
+	if scale < 0.5 then
+		uiScale.Scale = scale * 1.4
+	elseif scale < 0.8 then
+		uiScale.Scale = scale * 1.2
+	elseif scale < 1 then
+		uiScale.Scale = scale * 1.05
+	elseif scale > 1 then
+		uiScale.Scale = scale * 0.85
+	else
+		uiScale.Scale = 1
+	end
+end
+
+updateScale()
+workspace.CurrentCamera:GetPropertyChangedSignal("ViewportSize"):Connect(updateScale)
+
+-- ============================================================
+-- TOPBARPLUS ICON
+-- ============================================================
+local Icon = require(ReplicatedStorage:WaitForChild("Icon"))
+
+local musicIcon = Icon.new()
+	:setName("MusicPlayer")
+	:setLabel("♪ Music", "Deselected")
+	:setLabel("✕ Close", "Selected")
+	:align("Left")
+
+-- ============================================================
+-- MAIN FRAME
+-- ============================================================
+local Main = mkFrame(Gui,
+	UDim2.new(0,660,0,560),
+	UDim2.new(0.5,-330,0.5,-280),
+	C.white, 0.12, 5, 18)
+Main.Name    = "Main"
+Main.Visible = false
+mkStroke(Main, C.greenL, 1.8)
+
+musicIcon:bindEvent("selected",   function() Main.Visible = true  end)
+musicIcon:bindEvent("deselected", function() Main.Visible = false end)
+
+-- ============================================================
+-- HEADER
+-- ============================================================
+local Header = mkFrame(Main, UDim2.new(1,0,0,50), UDim2.new(0,0,0,0), C.green, 0, 6, 18)
+mkFrame(Header, UDim2.new(1,0,0.5,0), UDim2.new(0,0,0.5,0), C.green, 0, 6, 0)
+
+local TitleLbl = Instance.new("TextLabel")
+TitleLbl.Size               = UDim2.new(1,-110,1,0)
+TitleLbl.Position           = UDim2.new(0,18,0,0)
+TitleLbl.BackgroundTransparency = 1
+TitleLbl.Text               = "Music Daives"
+TitleLbl.Font               = Enum.Font.GothamBold
+TitleLbl.TextSize           = 17
+TitleLbl.TextColor3         = C.white
+TitleLbl.TextXAlignment     = Enum.TextXAlignment.Left
+TitleLbl.ZIndex             = 7
+TitleLbl.Parent             = Header
+
+local CloseBtn = Instance.new("TextButton")
+CloseBtn.Size               = UDim2.new(0,32,0,32)
+CloseBtn.Position           = UDim2.new(1,-44,0.5,-16)
+CloseBtn.BackgroundColor3   = C.red
+CloseBtn.BackgroundTransparency = 0
+CloseBtn.Text               = "X"
+CloseBtn.Font               = Enum.Font.GothamBold
+CloseBtn.TextSize           = 14
+CloseBtn.TextColor3         = C.white
+CloseBtn.BorderSizePixel    = 0
+CloseBtn.ZIndex             = 8
+CloseBtn.Parent             = Header
+Instance.new("UICorner", CloseBtn).CornerRadius = UDim.new(1,0)
+
+mkFrame(Main, UDim2.new(1,-20,0,1), UDim2.new(0,10,0,50), C.greenL, 0.5, 6, 0)
+
+-- ============================================================
+-- GENRE TABS
+-- ============================================================
+local genres  = {"Trend","DJ","Koplo","Galau"}
+local tabBtns = {}
+
+local TabBar = Instance.new("Frame")
+TabBar.Size               = UDim2.new(0,316,0,32)
+TabBar.Position           = UDim2.new(0,8,0,58)
+TabBar.BackgroundTransparency = 1
+TabBar.ZIndex             = 6
+TabBar.Parent             = Main
+local TL = Instance.new("UIListLayout", TabBar)
+TL.FillDirection = Enum.FillDirection.Horizontal
+TL.SortOrder     = Enum.SortOrder.LayoutOrder
+TL.Padding       = UDim.new(0,4)
+
+for i, g in ipairs(genres) do
+	local t = Instance.new("TextButton")
+	t.Size                  = UDim2.new(0,74,0,28)
+	t.BackgroundColor3      = C.panel
+	t.BackgroundTransparency = 0.1
+	t.Text                  = g
+	t.Font                  = Enum.Font.GothamBold
+	t.TextSize              = 12
+	t.TextColor3            = C.greenD
+	t.BorderSizePixel       = 0
+	t.LayoutOrder           = i
+	t.ZIndex                = 7
+	t.Parent                = TabBar
+	Instance.new("UICorner", t).CornerRadius = UDim.new(0,7)
+	mkStroke(t, C.green, 1.2, 0.4)
+	tabBtns[g] = t
+end
+
+-- ============================================================
+-- GARIS VERTIKAL + PANEL KIRI (SONG LIST)
+-- ============================================================
+mkFrame(Main, UDim2.new(0,1,0,458), UDim2.new(0,332,0,54), C.greenL, 0.4, 6, 0)
+
+local SongScroll = Instance.new("ScrollingFrame")
+SongScroll.Size                  = UDim2.new(0,318,0,418)
+SongScroll.Position              = UDim2.new(0,7,0,94)
+SongScroll.BackgroundColor3      = C.panel
+SongScroll.BackgroundTransparency = 0.08
+SongScroll.BorderSizePixel       = 0
+SongScroll.ScrollBarThickness    = 5
+SongScroll.ScrollBarImageColor3  = C.green
+SongScroll.ScrollingDirection    = Enum.ScrollingDirection.Y
+SongScroll.CanvasSize            = UDim2.new(0,0,0,0)
+SongScroll.AutomaticCanvasSize   = Enum.AutomaticSize.Y
+SongScroll.ZIndex                = 6
+SongScroll.Parent                = Main
+Instance.new("UICorner", SongScroll).CornerRadius = UDim.new(0,10)
+mkStroke(SongScroll, C.greenL, 1.2, 0.4)
+local SLL = Instance.new("UIListLayout", SongScroll)
+SLL.SortOrder = Enum.SortOrder.LayoutOrder
+SLL.Padding   = UDim.new(0,3)
+local SP = Instance.new("UIPadding", SongScroll)
+SP.PaddingTop    = UDim.new(0,6)
+SP.PaddingBottom = UDim.new(0,6)
+SP.PaddingLeft   = UDim.new(0,6)
+SP.PaddingRight  = UDim.new(0,12)
+
+-- ============================================================
+-- PANEL KANAN
+-- ============================================================
+local PANEL_X    = 346
+local PANEL_W    = 302
+local COVER_SIZE = 120
+local COVER_X    = PANEL_X + math.floor((PANEL_W - COVER_SIZE) / 2)
+local COVER_Y    = 62
+
+local NowPlayingLbl = Instance.new("TextLabel")
+NowPlayingLbl.Size               = UDim2.new(0, PANEL_W, 0, 18)
+NowPlayingLbl.Position           = UDim2.new(0, PANEL_X, 0, COVER_Y)
+NowPlayingLbl.BackgroundTransparency = 1
+NowPlayingLbl.Text               = "NOW PLAYING"
+NowPlayingLbl.Font               = Enum.Font.GothamBold
+NowPlayingLbl.TextSize           = 11
+NowPlayingLbl.TextColor3         = C.greenD
+NowPlayingLbl.TextXAlignment     = Enum.TextXAlignment.Center
+NowPlayingLbl.ZIndex             = 7
+NowPlayingLbl.Parent             = Main
+
+local COVER_IMG_Y = COVER_Y + 22
+
+local CoverFrame = mkFrame(Main,
+	UDim2.new(0, COVER_SIZE+8, 0, COVER_SIZE+8),
+	UDim2.new(0, COVER_X-4, 0, COVER_IMG_Y-4),
+	C.greenL, 0, 6, 16)
+mkStroke(CoverFrame, C.greenD, 1.5, 0.2)
+
+local CoverImg = Instance.new("ImageLabel")
+CoverImg.Size                 = UDim2.new(0, COVER_SIZE, 0, COVER_SIZE)
+CoverImg.Position             = UDim2.new(0, COVER_X, 0, COVER_IMG_Y)
+CoverImg.BackgroundColor3     = C.panel
+CoverImg.BackgroundTransparency = 0.1
+CoverImg.Image                = COVER_IMAGE
+CoverImg.ScaleType            = Enum.ScaleType.Crop
+CoverImg.BorderSizePixel      = 0
+CoverImg.ZIndex               = 7
+CoverImg.Parent               = Main
+Instance.new("UICorner", CoverImg).CornerRadius = UDim.new(0, 12)
+
+local NAME_Y = COVER_IMG_Y + COVER_SIZE + 8
+
+local NowLbl = Instance.new("TextLabel")
+NowLbl.Size                 = UDim2.new(0, PANEL_W, 0, 32)
+NowLbl.Position             = UDim2.new(0, PANEL_X, 0, NAME_Y)
+NowLbl.BackgroundTransparency = 1
+NowLbl.Text                 = "Pilih lagu untuk diputar"
+NowLbl.Font                 = Enum.Font.GothamBold
+NowLbl.TextSize             = 13
+NowLbl.TextColor3           = C.green
+NowLbl.TextXAlignment       = Enum.TextXAlignment.Center
+NowLbl.TextYAlignment       = Enum.TextYAlignment.Center
+NowLbl.TextTruncate         = Enum.TextTruncate.AtEnd
+NowLbl.ZIndex               = 7
+NowLbl.Parent               = Main
+
+local DUR_Y = NAME_Y + 34
+
+local DurationLbl = Instance.new("TextLabel")
+DurationLbl.Size               = UDim2.new(0, PANEL_W, 0, 22)
+DurationLbl.Position           = UDim2.new(0, PANEL_X, 0, DUR_Y)
+DurationLbl.BackgroundTransparency = 1
+DurationLbl.Text               = "00:00 / 00:00"
+DurationLbl.Font               = Enum.Font.GothamBold
+DurationLbl.TextSize           = 15
+DurationLbl.TextColor3         = C.green
+DurationLbl.TextXAlignment     = Enum.TextXAlignment.Center
+DurationLbl.ZIndex             = 7
+DurationLbl.Parent             = Main
+
+local PROG_Y    = DUR_Y + 26
+local ProgTrack = mkFrame(Main, UDim2.new(0, PANEL_W, 0, 6), UDim2.new(0, PANEL_X, 0, PROG_Y), C.panel, 0.1, 7, 99)
+mkStroke(ProgTrack, C.green, 1, 0.4)
+local ProgFill = mkFrame(ProgTrack, UDim2.new(0,0,1,0), UDim2.new(0,0,0,0), C.green, 0, 8, 99)
+
+-- ============================================================
+-- TOMBOL KONTROL
+-- ============================================================
+local ROW1_Y  = PROG_Y + 14
+local ROW1_X  = PANEL_X
+local ROW_W   = PANEL_W
+local SM, BG_ = 44, 58
+local TOTAL_W = SM*4 + BG_ + 8*4
+local R1START = ROW1_X + math.floor((ROW_W - TOTAL_W) / 2)
+
+local playBtn = nil
+local loopBtn = nil
+
+local function makeImgBtn(imageId, px, py, w, h)
+	local b = Instance.new("ImageButton")
+	b.Size                  = UDim2.new(0,w,0,h)
+	b.Position              = UDim2.new(0,px,0,py)
+	b.BackgroundColor3      = C.greenD
+	b.BackgroundTransparency = 1
+	b.Image                 = imageId
+	b.ImageColor3           = C.white
+	b.ScaleType             = Enum.ScaleType.Fit
+	b.BorderSizePixel       = 0
+	b.ZIndex                = 7
+	b.Parent                = Main
+	Instance.new("UICorner", b).CornerRadius = UDim.new(1,0)
+	b.MouseEnter:Connect(function()
+		b.BackgroundTransparency = 0.7
+		b.ImageColor3 = C.greenL
+	end)
+	b.MouseLeave:Connect(function()
+		b.BackgroundTransparency = 1
+		b.ImageColor3 = C.white
+	end)
+	return b
+end
+
+local defs1 = {
+	{ key = "shuffle", w = SM,  h = SM  },
+	{ key = "prev",    w = SM,  h = SM  },
+	{ key = "play",    w = BG_, h = BG_ },
+	{ key = "next",    w = SM,  h = SM  },
+	{ key = "loop",    w = SM,  h = SM  },
+}
+
+local iconBtns = {}
+local xc = R1START
+for i, def in ipairs(defs1) do
+	local yOff = (def.w == BG_) and (ROW1_Y - 7) or ROW1_Y
+	local b = makeImgBtn(Icons[def.key], xc, yOff, def.w, def.h)
+	iconBtns[i] = b
+	if def.key == "play" then playBtn = b end
+	if def.key == "loop" then loopBtn = b end
+	xc = xc + def.w + 8
+end
+
+-- ============================================================
+-- TOMBOL SOLID TEXT
+-- ============================================================
+local ROW2_Y   = ROW1_Y + BG_ + 10
+local B2W, B2H = 144, 38
+local B2GAP    = 10
+local R2START  = ROW1_X + math.floor((ROW_W - B2W*2 - B2GAP) / 2)
+
+local function mkSolidBtn(txt, px, py, w, h, bgColor)
+	local b = Instance.new("TextButton")
+	b.Size                  = UDim2.new(0,w,0,h)
+	b.Position              = UDim2.new(0,px,0,py)
+	b.BackgroundColor3      = bgColor
+	b.BackgroundTransparency = 0
+	b.Text                  = txt
+	b.Font                  = Enum.Font.GothamBold
+	b.TextSize              = 13
+	b.TextColor3            = C.white
+	b.BorderSizePixel       = 0
+	b.ZIndex                = 7
+	b.Parent                = Main
+	Instance.new("UICorner", b).CornerRadius = UDim.new(0,10)
+	return b
+end
+
+local BtnPlaylist = mkSolidBtn("▶  Play Playlist", R2START,            ROW2_Y, B2W, B2H, C.green)
+local BtnStop     = mkSolidBtn("⏹  Stop",          R2START+B2W+B2GAP, ROW2_Y, B2W, B2H, C.red)
+
+BtnPlaylist.MouseEnter:Connect(function() BtnPlaylist.BackgroundColor3 = C.greenL end)
+BtnPlaylist.MouseLeave:Connect(function() BtnPlaylist.BackgroundColor3 = C.green  end)
+BtnStop.MouseEnter:Connect(function() BtnStop.BackgroundColor3 = Color3.fromRGB(210,60,60) end)
+BtnStop.MouseLeave:Connect(function() BtnStop.BackgroundColor3 = C.red end)
+
+-- ============================================================
+-- VOLUME SLIDER
+-- ============================================================
+local VSY = ROW2_Y + B2H + 16
+
+local VolLbl = Instance.new("TextLabel")
+VolLbl.Size                 = UDim2.new(0,150,0,18)
+VolLbl.Position             = UDim2.new(0, PANEL_X, 0, VSY)
+VolLbl.BackgroundTransparency = 1
+VolLbl.Text                 = "♪  VOLUME"
+VolLbl.Font                 = Enum.Font.GothamBold
+VolLbl.TextSize             = 11
+VolLbl.TextColor3           = C.greenD
+VolLbl.TextXAlignment       = Enum.TextXAlignment.Left
+VolLbl.ZIndex               = 7
+VolLbl.Parent               = Main
+
+local VolPct = Instance.new("TextLabel")
+VolPct.Size                 = UDim2.new(0, PANEL_W, 0, 18)
+VolPct.Position             = UDim2.new(0, PANEL_X, 0, VSY)
+VolPct.BackgroundTransparency = 1
+VolPct.Text                 = "50%"
+VolPct.Font                 = Enum.Font.GothamMedium
+VolPct.TextSize             = 11
+VolPct.TextColor3           = C.greenD
+VolPct.TextXAlignment       = Enum.TextXAlignment.Right
+VolPct.ZIndex               = 7
+VolPct.Parent               = Main
+
+local VolTrack = mkFrame(Main, UDim2.new(0, PANEL_W, 0, 10), UDim2.new(0, PANEL_X, 0, VSY+24), C.panel, 0.1, 7, 99)
+mkStroke(VolTrack, C.green, 1.2, 0.35)
+local VolFill = mkFrame(VolTrack, UDim2.new(State.volume,0,1,0), UDim2.new(0,0,0,0), C.green, 0, 8, 99)
+local VolKnob = mkFrame(VolTrack, UDim2.new(0,18,0,18), UDim2.new(State.volume,-9,0.5,-9), C.greenL, 0, 9, 99)
+mkStroke(VolKnob, C.white, 1.5, 0.3)
+
+local function applyVol(mx)
+	local v = math.clamp((mx - VolTrack.AbsolutePosition.X) / VolTrack.AbsoluteSize.X, 0, 1)
+	State.volume     = v
+	VolFill.Size     = UDim2.new(v,0,1,0)
+	VolKnob.Position = UDim2.new(v,-9,0.5,-9)
+	VolPct.Text      = math.floor(v*100) .. "%"
+	if State.sound then State.sound.Volume = v end
+end
+
+VolTrack.InputBegan:Connect(function(i)
+	if i.UserInputType == Enum.UserInputType.MouseButton1
+		or i.UserInputType == Enum.UserInputType.Touch then
+		State.dragging = true ; applyVol(i.Position.X)
+	end
+end)
+UserInputService.InputChanged:Connect(function(i)
+	if State.dragging and (i.UserInputType == Enum.UserInputType.MouseMovement
+		or i.UserInputType == Enum.UserInputType.Touch) then
+		applyVol(i.Position.X)
+	end
+end)
+UserInputService.InputEnded:Connect(function(i)
+	if i.UserInputType == Enum.UserInputType.MouseButton1
+		or i.UserInputType == Enum.UserInputType.Touch then
+		State.dragging = false
+	end
+end)
+
+-- ============================================================
+-- STATUS BAR BAWAH
+-- ============================================================
+local BotBar = mkFrame(Main, UDim2.new(1,0,0,26), UDim2.new(0,0,1,-26), C.green, 0.1, 6, 18)
+mkFrame(BotBar, UDim2.new(1,0,0.5,0), UDim2.new(0,0,0,0), C.green, 0.1, 6, 0)
+
+local StatusLbl = Instance.new("TextLabel")
+StatusLbl.Size              = UDim2.new(1,-20,1,0)
+StatusLbl.Position          = UDim2.new(0,12,0,0)
+StatusLbl.BackgroundTransparency = 1
+StatusLbl.Text              = "Siap diputar"
+StatusLbl.Font              = Enum.Font.GothamMedium
+StatusLbl.TextSize          = 11
+StatusLbl.TextColor3        = C.white
+StatusLbl.TextXAlignment    = Enum.TextXAlignment.Left
+StatusLbl.ZIndex            = 7
+StatusLbl.Parent            = BotBar
+
+-- ============================================================
+-- UPDATE DURASI
+-- ============================================================
+RunService.Heartbeat:Connect(function()
+	if State.sound and State.playing then
+		local pos   = State.sound.TimePosition
+		local total = State.sound.TimeLength
+		DurationLbl.Text = formatTime(pos) .. " / " .. formatTime(total)
+		if total > 0 then
+			ProgFill.Size = UDim2.new(math.clamp(pos / total, 0, 1), 0, 1, 0)
+		end
+	end
+end)
+
+-- ============================================================
+-- FUNGSI MUSIK
+-- ============================================================
+local songItems = {}
+local doPlay
+
+local function resetDuration()
+	DurationLbl.Text = "00:00 / 00:00"
+	ProgFill.Size    = UDim2.new(0, 0, 1, 0)
+end
+
+-- refreshTabs dideklarasikan SEBELUM doPlay agar bisa dipanggil di dalam doPlay
+local function refreshTabs()
+	for _, g in ipairs(genres) do
+		local b = tabBtns[g]
+		if g == State.genre then
+			b.BackgroundColor3       = C.green
+			b.BackgroundTransparency = 0
+			b.TextColor3             = C.white
+		else
+			b.BackgroundColor3       = C.panel
+			b.BackgroundTransparency = 0.1
+			b.TextColor3             = C.greenD
+		end
+	end
+end
+
+local function refreshSongList()
+	for _, v in ipairs(songItems) do v:Destroy() end
+	songItems = {}
+
+	local pl = Playlists[State.genre]
+	for i, song in ipairs(pl) do
+		local active = (State.playingGenre == State.genre) and (i == State.playingIndex)
+		local row = Instance.new("TextButton")
+		row.Size                 = UDim2.new(1,0,0,36)
+		row.BackgroundColor3     = active and C.green or C.white
+		row.BackgroundTransparency = active and 0 or 0.35
+		row.Text                 = (active and "▶  " or "    ") .. i .. ".  " .. song.name
+		row.Font                 = active and Enum.Font.GothamBold or Enum.Font.Gotham
+		row.TextSize             = 12
+		row.TextColor3           = active and C.white or C.greenD
+		row.TextXAlignment       = Enum.TextXAlignment.Left
+		row.BorderSizePixel      = 0
+		row.LayoutOrder          = i
+		row.ZIndex               = 7
+		row.Parent               = SongScroll
+		Instance.new("UICorner", row).CornerRadius = UDim.new(0,7)
+		local rp = Instance.new("UIPadding", row)
+		rp.PaddingLeft = UDim.new(0,8)
+		table.insert(songItems, row)
+
+		local idx = i
+		row.MouseButton1Click:Connect(function()
+			if State.index ~= idx then
+				State.index = idx
+				if State.sound then
+					State.sound:Stop()
+					State.sound:Destroy()
+					State.sound = nil
+				end
+				State.playing = false
+			elseif State.playing and State.playingGenre == State.genre then
+				return
+			end
+			doPlay()
+		end)
+
+		row.MouseEnter:Connect(function()
+			local isActive = (State.playingGenre == State.genre) and (idx == State.playingIndex)
+			if not isActive then
+				row.BackgroundColor3 = C.panel ; row.BackgroundTransparency = 0
+			end
+		end)
+		row.MouseLeave:Connect(function()
+			local isActive = (State.playingGenre == State.genre) and (idx == State.playingIndex)
+			if not isActive then
+				row.BackgroundColor3 = C.white ; row.BackgroundTransparency = 0.35
+			end
+		end)
+	end
+end
+
+local function setPlayIcon(isNowPlaying)
+	if playBtn then
+		playBtn.Image = isNowPlaying and Icons.pause or Icons.play
+	end
+end
+
+local function doStop()
+	State.playing      = false
+	State.playingGenre = nil
+	State.playingIndex = nil
+	if State.sound then
+		State.sound:Stop()
+		State.sound:Destroy()
+		State.sound = nil
+	end
+	setPlayIcon(false)
+	resetDuration()
+	NowLbl.Text          = "Dihentikan"
+	StatusLbl.Text       = "⏹  Dihentikan"
+	StatusLbl.TextColor3 = Color3.fromRGB(255,200,200)
+	refreshSongList()
+end
+
+local function doPause()
+	if State.sound and State.playing then
+		State.sound:Pause()
+		State.playing = false
+		setPlayIcon(false)
+		StatusLbl.Text = "⏸  Dijeda"
+		refreshSongList()
+	end
+end
+
+-- ============================================================
+-- doPlay - FUNGSI UTAMA
+-- ============================================================
+doPlay = function()
+	if State.sound and not State.playing then
+		State.sound:Resume()
+		State.playing = true
+		setPlayIcon(true)
+		local pl = Playlists[State.genre]
+		StatusLbl.Text       = "▶  " .. (pl[State.index] and pl[State.index].name or "?")
+		StatusLbl.TextColor3 = C.white
+		State.playingGenre   = State.genre
+		State.playingIndex   = State.index
+		refreshSongList()
+		return
+	end
+
+	if State.sound then
+		State.sound:Stop()
+		State.sound:Destroy()
+		State.sound = nil
+	end
+
+	State.playing = false
+	resetDuration()
+
+	local pl   = Playlists[State.genre]
+	local song = pl[State.index]
+	if not song then return end
+
+	local snd = Instance.new("Sound")
+	snd.SoundId = "rbxassetid://" .. tostring(song.id)
+	snd.Volume  = State.volume
+	snd.Parent  = SoundService
+	State.sound = snd
+
+	snd.Loaded:Wait()
+	snd:Play()
+	State.playing      = true
+	State.playingGenre = State.genre
+	State.playingIndex = State.index
+	setPlayIcon(true)
+
+	DurationLbl.Text     = "00:00 / " .. formatTime(snd.TimeLength)
+	NowLbl.Text          = song.name
+	StatusLbl.Text       = "▶  " .. song.name
+	StatusLbl.TextColor3 = C.white
+
+	refreshSongList()
+
+	local thisSnd = snd  -- simpan referensi lokal
+	snd.Ended:Connect(function()
+		if State.sound ~= thisSnd then return end
+
+		local finishedGenre = State.playingGenre
+		local finishedIndex = State.playingIndex
+
+		State.playing      = false
+		State.playingGenre = nil
+		State.playingIndex = nil
+		State.sound        = nil  -- ← TAMBAH INI, clear sound dulu
+		setPlayIcon(false)
+		resetDuration()
+
+		if State.looping then
+			task.wait(0.2)
+			State.genre = finishedGenre
+			State.index = finishedIndex
+			refreshTabs()
+			doPlay()
+		else
+			task.wait(0.4)
+			if not finishedGenre then return end  -- safety check
+			local pl2 = Playlists[finishedGenre]
+			State.genre = finishedGenre
+			State.index = finishedIndex % #pl2 + 1
+			refreshTabs()
+			refreshSongList()
+			doPlay()
+		end
+	end)
+end
+    
+	
+-- ============================================================
+-- FUNGSI NAVIGASI
+-- ============================================================
+local function doNext()
+	local pl = Playlists[State.genre]
+	State.index = State.index % #pl + 1
+	refreshSongList()
+	doPlay()
+end
+
+local function doPrev()
+	local pl = Playlists[State.genre]
+	State.index = ((State.index - 2) % #pl) + 1
+	refreshSongList()
+	doPlay()
+end
+
+local function doPlaylist()
+	State.playlist = true
+	State.index    = 1
+	refreshSongList()
+	doPlay()
+end
+
+local function doRandom()
+	State.playlist = true
+	State.index    = math.random(1, #Playlists[State.genre])
+	refreshSongList()
+	doPlay()
+end
+
+-- ============================================================
+-- CONNECT SEMUA TOMBOL
+-- ============================================================
+iconBtns[1].MouseButton1Click:Connect(doRandom)
+iconBtns[2].MouseButton1Click:Connect(doPrev)
+iconBtns[3].MouseButton1Click:Connect(function()
+	if State.playing then doPause() else doPlay() end
+end)
+iconBtns[4].MouseButton1Click:Connect(doNext)
+iconBtns[5].MouseButton1Click:Connect(function()
+	State.looping = not State.looping
+	loopBtn.ImageColor3 = State.looping and C.green or C.white
+	StatusLbl.Text = State.looping and "Loop: ON" or "Loop: OFF"
+end)
+
+BtnPlaylist.MouseButton1Click:Connect(doPlaylist)
+BtnStop.MouseButton1Click:Connect(function()
+	doStop()
+	State.playlist = false
+end)
+
+for _, g in ipairs(genres) do
+	local genre = g
+	tabBtns[g].MouseButton1Click:Connect(function()
+		State.genre = genre
+		State.index = 1
+		refreshTabs()
+		refreshSongList()
+	end)
+end
+
+CloseBtn.MouseButton1Click:Connect(function()
+	musicIcon:deselect()
+end)
+
+-- ============================================================
+-- INIT
+-- ============================================================
+refreshTabs()
+refreshSongList()
+
+print("[MUSICGUIBYDEMZZT] Loaded - Auto Next Fixed OK")
