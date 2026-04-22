@@ -1,0 +1,200 @@
+-- Script: PalmServer (Modified for Massless Support)
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local palmEvent = ReplicatedStorage:WaitForChild("PalmEvent")
+
+local SIT_ANIMATIONS = {
+	"rbxassetid://95731946834298",
+	"rbxassetid://136524035457985",
+	"rbxassetid://82658426526777",
+}
+
+local palmData = {}
+
+-- Fungsi Baru: Mengatur Massless pada Karakter
+local function setCharacterMassless(character, state)
+	if not character then return end
+	for _, part in ipairs(character:GetDescendants()) do
+		if part:IsA("BasePart") then
+			part.Massless = state
+		end
+	end
+end
+
+local function getToolModel(playerA)
+	local character = playerA.Character
+	if not character then return nil end
+	local palmTool = character:FindFirstChild("PalemTool")
+	if not palmTool then return nil end
+	return palmTool:FindFirstChild("DaunPalemModel")
+end
+
+local function getEmptySeat(model)
+	local seat = model:FindFirstChild("Seat1")
+	if seat and not seat.Occupant then
+		return seat
+	end
+	return nil
+end
+
+local function updatePrompt(data, model)
+	local seat1 = model:FindFirstChild("Seat1")
+	local prompt = seat1 and seat1:FindFirstChildOfClass("ProximityPrompt")
+	if not prompt then return end
+	local count = 0
+	for _ in pairs(data.riders) do count += 1 end
+	prompt.Enabled = count < 1
+end
+
+local function ejectAllRiders(data)
+	for rider, track in pairs(data.riders) do
+		if track then track:Stop() end
+		local char = rider.Character
+		if char then
+			-- KEMBALIKAN: Berat badan player B saat turun
+			setCharacterMassless(char, false)
+			local hum = char:FindFirstChildOfClass("Humanoid")
+			if hum then hum.Sit = false end
+		end
+	end
+	data.riders = {}
+end
+
+local function setupPrompt(playerA, data, model)
+	local seat1 = model:FindFirstChild("Seat1")
+	local prompt = seat1 and seat1:FindFirstChildOfClass("ProximityPrompt")
+	if not prompt then return end
+
+	prompt.Enabled = true
+
+	local conn = prompt.Triggered:Connect(function(playerB)
+		if playerB == playerA then return end
+		local d = palmData[playerA]
+		if not d or d.riders[playerB] then return end 
+
+		local seat = getEmptySeat(model)
+		if not seat then return end
+
+		local charB = playerB.Character
+		if not charB then return end
+		local humB = charB:FindFirstChildOfClass("Humanoid")
+		if not humB then return end
+
+		-- AKTIFKAN: Massless agar player B tidak berat saat ditarik
+		setCharacterMassless(charB, true)
+
+		seat:Sit(humB)
+
+		local animatorB = humB:FindFirstChildOfClass("Animator")
+		local anim = Instance.new("Animation")
+		anim.AnimationId = SIT_ANIMATIONS[math.random(1, #SIT_ANIMATIONS)]
+		local track = animatorB:LoadAnimation(anim)
+		track.Looped = true
+		track:Play()
+
+		d.riders[playerB] = track
+		updatePrompt(d, model)
+
+		local seatedConn
+		seatedConn = humB.Seated:Connect(function(isSeated)
+			if not isSeated then
+				seatedConn:Disconnect()
+				if track then track:Stop() end
+				if d.riders then d.riders[playerB] = nil end
+
+				-- KEMBALIKAN: Berat badan normal saat player B berdiri sendiri
+				setCharacterMassless(charB, false)
+
+				updatePrompt(d, model)
+			end
+		end)
+	end)
+
+	data.promptConn = conn
+end
+
+-- Fungsi: Cleanup saat unequip (FIXED SOUND BUG)
+local function cleanupPalm(playerA)
+	local data = palmData[playerA]
+	if not data then return end
+
+	-- 1. Ambil model SEBELUM data dibersihkan
+	local model = getToolModel(playerA)
+
+	-- 2. Putuskan koneksi prompt
+	if data.promptConn then
+		data.promptConn:Disconnect()
+		data.promptConn = nil
+	end
+
+	-- 3. Eject semua rider & kembalikan berat badan (Massless = false)
+	ejectAllRiders(data)
+
+	-- 4. Matikan efek (Sound & Smoke) secara paksa
+	if model then
+		local seat1 = model:FindFirstChild("Seat1")
+		if seat1 then
+			local smoke = seat1:FindFirstChildOfClass("Smoke")
+			local sound = seat1:FindFirstChildOfClass("Sound")
+			local prompt = seat1:FindFirstChildOfClass("ProximityPrompt")
+
+			if smoke then smoke.Enabled = false end
+			if sound then 
+				sound:Stop() 
+				-- Tambahkan ini untuk memastikan sound benar-benar mati
+				sound.Playing = false 
+			end
+			if prompt then prompt.Enabled = false end
+		end
+	end
+
+	palmData[playerA] = nil
+end
+
+palmEvent.OnServerEvent:Connect(function(playerA, action, value)
+	if action == "Equipped" then
+		cleanupPalm(playerA)
+		local model = getToolModel(playerA)
+		if not model then return end
+		local data = { riders = {}, promptConn = nil }
+		palmData[playerA] = data
+		setupPrompt(playerA, data, model)
+
+	elseif action == "Unequipped" then
+		-- Panggil cleanup terlebih dahulu
+		cleanupPalm(playerA)
+
+		-- Pastikan lagi sound mati (Double Check)
+		local character = playerA.Character
+		if character then
+			-- Cari di dalam karakter jika tool baru saja berpindah ke backpack
+			local tool = character:FindFirstChild("PalmTool") or playerA.Backpack:FindFirstChild("PalmTool")
+			if tool then
+				local model = tool:FindFirstChild("DaunPalemModel")
+				local seat = model and model:FindFirstChild("Seat1")
+				local sound = seat and seat:FindFirstChildOfClass("Sound")
+				if sound then sound:Stop() end
+			end
+		end
+		
+	elseif action == "Moving" then
+		local model = getToolModel(playerA)
+		if not model then return end
+		local seat1 = model:FindFirstChild("Seat1")
+		if not seat1 then return end
+		local smoke = seat1:FindFirstChildOfClass("Smoke")
+		local sound = seat1:FindFirstChildOfClass("Sound")
+
+		if value then
+			if smoke then smoke.Enabled = true end
+			if sound and not sound.IsPlaying then sound:Play() end
+		else
+			if smoke then smoke.Enabled = false end
+			if sound then sound:Stop() end
+		end
+	end
+end)
+
+Players.PlayerRemoving:Connect(function(player)
+	cleanupPalm(player)
+end)
