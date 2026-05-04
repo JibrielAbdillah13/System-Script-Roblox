@@ -1,0 +1,982 @@
+-- ServerScriptService/TerlaSystems/Checkpoints/CheckpointService
+
+local Players = game:GetService("Players")
+local ServerStorage = game:GetService("ServerStorage")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local HttpService = game:GetService("HttpService")
+
+Players.CharacterAutoLoads = false
+
+local CheckpointConfig = require(ServerStorage.TerlaModules:WaitForChild("CheckpointConfig"))
+local ProfileManager = require(ServerStorage.TerlaModules:WaitForChild("ProfileStoreManager"))
+
+pcall(function()
+	if typeof(CheckpointConfig.RespawnTime) == "number" then
+		Players.RespawnTime = CheckpointConfig.RespawnTime
+	end
+end)
+
+local function debugPrint(...)
+	if CheckpointConfig.EnableDebug then
+		print("[CheckpointService]", ...)
+	end
+end
+
+local function getOrCreateRE(name)
+	local ev = ReplicatedStorage:FindFirstChild(name)
+	if not ev then
+		ev = Instance.new("RemoteEvent")
+		ev.Name = name
+		ev.Parent = ReplicatedStorage
+	end
+	return ev
+end
+
+local function getOrCreateRF(name)
+	local rf = ReplicatedStorage:FindFirstChild(name)
+	if not rf then
+		rf = Instance.new("RemoteFunction")
+		rf.Name = name
+		rf.Parent = ReplicatedStorage
+	end
+	return rf
+end
+
+local DropAckRE = getOrCreateRE("CP_DropAck")
+local DropEvent = getOrCreateRE("CP_DropToStart")
+local MarkVisitedRE = getOrCreateRE("CP_MarkVisited")
+local ResetVisitedRE = getOrCreateRE("CP_ResetVisited")
+local SkipDeniedRE = getOrCreateRE("CP_SkipDenied")
+local SyncStateRE = getOrCreateRE("CP_SyncState")
+local CustomMessageRE = getOrCreateRE("CP_CustomMessage")
+local GetPublicCfgRF = getOrCreateRF("CP_GetPublicConfig")
+
+GetPublicCfgRF.OnServerInvoke = function(player)
+	return CheckpointConfig.Public()
+end
+
+local checkpointData = ServerStorage:FindFirstChild("CheckpointData")
+if not checkpointData then
+	checkpointData = Instance.new("Folder")
+	checkpointData.Name = "CheckpointData"
+	checkpointData.Parent = ServerStorage
+end
+
+local PlayerLapState = {}
+local PlayerSummitStatus = {}
+local EnforceSequential = {}
+local PlayerLoadingStatus = {}
+local PlayerLastActivity = {}
+
+local CheckpointDelay = {} -- waktu terakhir ambil checkpoint
+local GlobalTouchCD = {}      
+local FinishLock = {}        
+local RunId = {}              
+local LastAwardedRunId = {}   
+local PendingSummit = {}      
+
+local SpawnTouchImmunityUntil = {}
+
+local function isCarried(player)
+	return player:GetAttribute("IsCarried") == true
+end
+
+local function setupSpawnLocations()
+	for _, obj in workspace:GetDescendants() do
+		if obj:IsA("SpawnLocation") then
+			obj.Enabled = true
+			obj.Neutral = true
+			obj.Duration = CheckpointConfig.SpawnFFDuration or 0
+		end
+	end
+
+	workspace.DescendantAdded:Connect(function(obj)
+		if obj:IsA("SpawnLocation") then
+			obj.Enabled = true
+			obj.Neutral = true
+			obj.Duration = CheckpointConfig.SpawnFFDuration or 0
+		end
+	end)
+end
+
+local function ensureLeaderstats(player)
+	local ls = player:FindFirstChild("leaderstats")
+	if not ls then
+		ls = Instance.new("Folder")
+		ls.Name = "leaderstats"
+		ls.Parent = player
+	end
+
+	local cp = ls:FindFirstChild("Checkpoint")
+	if not cp then
+		cp = Instance.new("IntValue")
+		cp.Name = "Checkpoint"
+		cp.Value = CheckpointConfig.StartIndex
+		cp.Parent = ls
+	end
+
+	local summit = ls:FindFirstChild("Summit")
+	if not summit then
+		summit = Instance.new("IntValue")
+		summit.Name = "Summit"
+		summit.Value = 0
+		summit.Parent = ls
+	end
+
+	return cp, summit
+end
+
+
+local function saveToDataStore(player, checkpointIndex, reason)
+	reason = reason or "unknown"
+	debugPrint("Saving checkpoint for", player.Name, "CP:", checkpointIndex, "Reason:", reason)
+
+
+	local success = false
+	for attempt = 1, 3 do
+		success = ProfileManager.SaveCheckpointImmediate(player, checkpointIndex)
+		if success then
+			debugPrint("Checkpoint saved successfully for", player.Name, "attempt:", attempt)
+			break
+		else
+			warn("Checkpoint save failed for", player.Name, "attempt:", attempt)
+			if attempt < 3 then task.wait(0.3 * attempt) end
+		end
+	end
+
+	return success
+end
+
+local function loadFromDataStore(player)
+	debugPrint("Loading checkpoint for", player.Name)
+	local checkpoint = ProfileManager.LoadCheckpointProfile(player)
+	debugPrint("Loaded checkpoint for", player.Name, "CP:", checkpoint)
+	return checkpoint
+end
+
+local function saveSummitSafe(player, value)
+	local pcallOk, saved = pcall(function()
+		return ProfileManager.SaveSummitData(player, value, true, false)
+	end)
+	return (pcallOk and saved == true)
+end
+
+local function flushPendingSummit(player)
+	local uid = player.UserId
+	if PendingSummit[uid] then
+		local _, summitLS = ensureLeaderstats(player)
+		local ok = false
+		for i = 1, 5 do
+			ok = saveSummitSafe(player, summitLS.Value)
+			if ok then
+				PendingSummit[uid] = nil
+				break
+			end
+			task.wait(0.5 * i)
+		end
+		if not ok then
+			local success = ProfileManager.SaveOfflinePlayerSummit(uid, summitLS.Value, "player_leaving_offline")
+			if success then
+				debugPrint("Offline summit save success for", player.Name)
+			else
+				warn("Offline summit save FAILED for", player.Name)
+			end
+			PendingSummit[uid] = nil
+		end
+	end
+end
+
+local function getCheckpointSpawnLocation(checkpointIndex)
+	local spawnLocationName = tostring(CheckpointConfig.PartPrefix) .. tostring(checkpointIndex)
+	for _, obj in workspace:GetDescendants() do
+		if obj:IsA("SpawnLocation") and obj.Name == spawnLocationName then
+			return obj
+		end
+	end
+	return nil
+end
+
+local function getCheckpointSpawnPosition(checkpointIndex)
+	local sp = getCheckpointSpawnLocation(checkpointIndex)
+	if sp then
+		local spawnPos = sp.Position + Vector3.new(
+			math.random(-(CheckpointConfig.SpawnRandomRange or 0), (CheckpointConfig.SpawnRandomRange or 0)),
+			(CheckpointConfig.SpawnOffset and CheckpointConfig.SpawnOffset.Y) or 0,
+			math.random(-(CheckpointConfig.SpawnRandomRange or 0), (CheckpointConfig.SpawnRandomRange or 0))
+		)
+		debugPrint("Using SpawnLocation for CP" .. checkpointIndex .. " at:", spawnPos)
+		return spawnPos
+	end
+
+	local cpFolder = workspace:FindFirstChild(CheckpointConfig.FolderName)
+	if not cpFolder then
+		warn("Checkpoint folder not found:", CheckpointConfig.FolderName)
+		return nil
+	end
+
+	local checkpointPart = cpFolder:FindFirstChild(CheckpointConfig.PartPrefix .. checkpointIndex)
+	if not checkpointPart then
+		warn("Checkpoint part not found:", CheckpointConfig.PartPrefix .. checkpointIndex)
+		return nil
+	end
+
+	local spawnPos = checkpointPart.Position + Vector3.new(
+		math.random(-(CheckpointConfig.SpawnRandomRange or 0), (CheckpointConfig.SpawnRandomRange or 0)),
+		(CheckpointConfig.SpawnOffset and CheckpointConfig.SpawnOffset.Y) or 0,
+		math.random(-(CheckpointConfig.SpawnRandomRange or 0), (CheckpointConfig.SpawnRandomRange or 0))
+	)
+
+	debugPrint("Using checkpoint part for CP" .. checkpointIndex .. " at:", spawnPos)
+	return spawnPos
+end
+
+local function teleportToCheckpoint(character, checkpointIndex, reason)
+	reason = reason or "unknown"
+
+	local spawnPos = getCheckpointSpawnPosition(checkpointIndex)
+	if not spawnPos then
+		warn("Could not find spawn position for CP" .. checkpointIndex)
+		return false
+	end
+
+	local humanoidRootPart = character:FindFirstChild("HumanoidRootPart")
+	if not humanoidRootPart then
+		warn("No HumanoidRootPart found for", character.Name)
+		return false
+	end
+
+	humanoidRootPart.CFrame = CFrame.new(spawnPos)
+	debugPrint("Teleported", character.Name, "to CP" .. checkpointIndex, "at:", spawnPos, "Reason:", reason)
+	return true
+end
+
+local function applyRespawnLocationForPlayer(player, cpIndex)
+	local sp = getCheckpointSpawnLocation(cpIndex)
+	if sp then
+		player.RespawnLocation = sp
+		debugPrint("Set RespawnLocation for", player.Name, "to:", sp.Name)
+		return true
+	else
+		player.RespawnLocation = nil
+		debugPrint("No SpawnLocation found for CP" .. cpIndex, "- RespawnLocation cleared for", player.Name)
+		return false
+	end
+end
+
+local function updatePlayerCP(player, newIndex, fromTouch)
+	fromTouch = fromTouch or false
+
+	if fromTouch and newIndex % 3 == 0 then
+		saveToDataStore(player, newIndex, "milestone")
+	end
+
+	debugPrint("Updating checkpoint for", player.Name, "to CP" .. newIndex, "fromTouch:", fromTouch)
+
+	player:SetAttribute("CPIndex", newIndex)
+	player:SetAttribute("LapFromStart", newIndex > CheckpointConfig.StartIndex)
+
+	local cpLS, _ = ensureLeaderstats(player)
+	cpLS.Value = newIndex
+
+	local userIdString = tostring(player.UserId)
+	local checkpointValue = checkpointData:FindFirstChild(userIdString)
+	if checkpointValue then
+		checkpointValue.Value = newIndex
+	end
+
+	applyRespawnLocationForPlayer(player, newIndex)
+
+	PlayerLastActivity[player.UserId] = os.time()
+
+	local saveReason = fromTouch and "touch_progress" or "system_update"
+	-- saveToDataStore(player, newIndex, saveReason)
+	-- hanya update memory (checkpointValue & leaderstats)
+	-- save dilakukan oleh autosave / player leaving
+
+	MarkVisitedRE:FireClient(player, newIndex, newIndex, fromTouch)
+
+	local visitedArr = {}
+	for i = CheckpointConfig.StartIndex, newIndex do
+		table.insert(visitedArr, i)
+	end
+	SyncStateRE:FireClient(player, newIndex, visitedArr)
+end
+
+local function resetPlayerCP(player)
+	local uid = player.UserId
+	local newIndex = CheckpointConfig.StartIndex
+
+	debugPrint("Resetting checkpoint for", player.Name, "to CP" .. newIndex)
+
+	player:SetAttribute("CPIndex", newIndex)
+	player:SetAttribute("LapFromStart", true)
+	player:SetAttribute("LapComplete", false)
+
+	local cpLS, _ = ensureLeaderstats(player)
+	cpLS.Value = newIndex
+
+	local userIdString = tostring(player.UserId)
+	local checkpointValue = checkpointData:FindFirstChild(userIdString)
+	if checkpointValue then
+		checkpointValue.Value = newIndex
+	end
+
+	applyRespawnLocationForPlayer(player, newIndex)
+
+	PlayerLastActivity[uid] = os.time()
+
+	RunId[uid] = HttpService:GenerateGUID(false)
+
+	saveToDataStore(player, newIndex, "reset")
+
+	ResetVisitedRE:FireClient(player)
+	MarkVisitedRE:FireClient(player, newIndex, newIndex, false)
+	SyncStateRE:FireClient(player, newIndex, {newIndex})
+end
+
+local function awardSummit(player)
+	local _, summitLS = ensureLeaderstats(player)
+	local uid = player.UserId
+	summitLS.Value = (summitLS.Value or 0) + 1
+	local newValue = summitLS.Value
+
+	PendingSummit[uid] = true
+	task.spawn(function()
+		local tries = 0
+		local savedOk = false
+		while tries < 5 and not savedOk do
+			tries += 1
+			local pcallOk, result = pcall(function()
+				return ProfileManager.SaveSummitData(player, newValue, true, false)
+			end)
+			savedOk = (pcallOk and result == true)
+			if not savedOk then task.wait(0.5 * tries) end
+		end
+
+		if savedOk then
+			PendingSummit[uid] = nil
+			ProfileManager.TriggerGlobalRefresh("summit")
+		else
+			warn("Failed to save summit for", player.Name, "- will retry on leave/shutdown")
+		end
+	end)
+end
+
+local function validateAndRepairPlayerState(player)
+	local uid = player.UserId
+	local userIdString = tostring(uid)
+	local checkpointValue = checkpointData:FindFirstChild(userIdString)
+
+	if not checkpointValue then return false end
+
+	local currentCP = checkpointValue.Value
+	local lapState = PlayerLapState[uid]
+	local summitState = PlayerSummitStatus[uid]
+
+	debugPrint("Validating state for", player.Name, "CP:", currentCP, "Lap:", lapState, "Summit:", summitState)
+
+	if currentCP == CheckpointConfig.FinishIndex and summitState == true then
+		debugPrint("Allowing new lap for completed summit player", player.Name)
+		PlayerLapState[uid] = false
+		PlayerSummitStatus[uid] = false
+		return true
+	elseif currentCP > CheckpointConfig.StartIndex and currentCP < CheckpointConfig.FinishIndex and (lapState ~= true) then
+		debugPrint("Repairing middle state (nil/false) for", player.Name)
+		PlayerLapState[uid] = true
+		if not RunId[uid] then
+			RunId[uid] = HttpService:GenerateGUID(false)
+		end
+		return true
+	elseif currentCP == CheckpointConfig.StartIndex and summitState == true then
+		debugPrint("Resetting summit status at start for", player.Name)
+		PlayerSummitStatus[uid] = false
+		return true
+	end
+
+	return false
+end
+
+DropEvent.OnServerEvent:Connect(function(player)
+	local uid = player.UserId
+
+	PlayerLapState[uid] = true
+	PlayerSummitStatus[uid] = false
+	player:SetAttribute("WantsNewLap", true) 
+
+	resetPlayerCP(player)
+
+	if player and player.Parent then
+		player:LoadCharacter()
+	end
+
+	DropAckRE:FireClient(player, true, "Berhasil reset!")
+end)
+
+local function setupCheckpointTouchSystem()
+	local cpFolder = workspace:WaitForChild(CheckpointConfig.FolderName)
+	local connectedParts = {}
+
+	local function connectCheckpointPart(part)
+		if not part:IsA("BasePart") then return end
+
+		local checkpointIndex = CheckpointConfig.ParseCheckpointIndex(part.Name)
+		if not checkpointIndex then return end
+
+		if connectedParts[part] then return end
+
+		part.CanTouch = true
+
+		local connection = part.Touched:Connect(function(hit)
+			local character = hit.Parent
+			if not character or not character:IsA("Model") then return end
+
+			local humanoid = character:FindFirstChildOfClass("Humanoid")
+			if not humanoid then return end
+
+			local player = Players:GetPlayerFromCharacter(character)
+			if not player then return end
+
+			if humanoid.Health <= 0 then return end
+			if humanoid.Sit == true and humanoid.SeatPart then return end
+			if isCarried(player) then return end
+
+			local uid = player.UserId
+			local now = os.clock()
+
+			local delayTime = 5 -- detik (bisa kamu pindah ke config)
+
+			if CheckpointDelay[uid] and (now - CheckpointDelay[uid]) < delayTime then
+				--CustomMessageRE:FireClient(player, "Tunggu " .. math.ceil(delayTime - (now - CheckpointDelay[uid])) .. " detik untuk checkpoint berikutnya!")
+				print("Tunggu delay 10 detik ya!!!")
+				return
+			end
+
+			local immSec = CheckpointConfig.SpawnTouchImmunitySeconds or 1
+			if SpawnTouchImmunityUntil[uid] and now < SpawnTouchImmunityUntil[uid] then
+				return
+			end
+
+			local cd = CheckpointConfig.TouchCooldown or 0.2
+			if GlobalTouchCD[uid] and (now - GlobalTouchCD[uid]) < cd then
+				return
+			end
+			GlobalTouchCD[uid] = now
+
+			local userIdString = tostring(player.UserId)
+			local checkpointValue = checkpointData:FindFirstChild(userIdString)
+
+			if checkpointValue then
+				validateAndRepairPlayerState(player)
+
+				local oldCP = checkpointValue.Value
+
+				debugPrint(player.Name, "touched CP" .. checkpointIndex, "current:", oldCP)
+
+				local sequential = EnforceSequential[uid]
+				if sequential == nil then
+					sequential = not CheckpointConfig.SkipMode
+					EnforceSequential[uid] = sequential
+				end
+
+				if PlayerLapState[uid] == nil then
+					PlayerLapState[uid] = (oldCP ~= CheckpointConfig.FinishIndex)
+					if PlayerLapState[uid] and not RunId[uid] then
+						RunId[uid] = HttpService:GenerateGUID(false)
+					end
+				end
+				if PlayerSummitStatus[uid] == nil then
+					PlayerSummitStatus[uid] = false
+				end
+
+				if checkpointIndex == CheckpointConfig.StartIndex then
+					local allowStart =
+						(oldCP == CheckpointConfig.StartIndex) or
+						(PlayerSummitStatus[uid] == true) or
+						(PlayerLapState[uid] == false) or
+						(player:GetAttribute("WantsNewLap") == true)
+
+					if not allowStart then
+						MarkVisitedRE:FireClient(player, CheckpointConfig.StartIndex, oldCP, false)
+						return
+					end
+
+					PlayerLapState[uid] = true
+					PlayerSummitStatus[uid] = false
+					RunId[uid] = HttpService:GenerateGUID(false)
+					player:SetAttribute("WantsNewLap", false)
+
+					if oldCP ~= CheckpointConfig.StartIndex then
+						debugPrint("Player", player.Name, "starting new lap from CP", oldCP)
+					end
+
+					updatePlayerCP(player, CheckpointConfig.StartIndex, true)
+
+					task.delay(0.1, function()
+						MarkVisitedRE:FireClient(player, CheckpointConfig.StartIndex, CheckpointConfig.StartIndex, true)
+					end)
+					return
+				end
+
+				if checkpointIndex == CheckpointConfig.FinishIndex then
+					if FinishLock[uid] then
+						debugPrint(player.Name, "finish locked - ignoring duplicate touch")
+						return
+					end
+					FinishLock[uid] = true
+					local function release()
+						FinishLock[uid] = nil
+					end
+
+					local canFinish = false
+					local reason = "unknown"
+
+					if PlayerLapState[uid] ~= true then
+						reason = "no_active_lap"
+						debugPrint(player.Name, "cannot finish - no active lap")
+					elseif PlayerSummitStatus[uid] == true then
+						reason = "already_completed"
+						debugPrint(player.Name, "cannot finish - already completed this lap")
+					else
+						if RunId[uid] and LastAwardedRunId[uid] == RunId[uid] then
+							reason = "already_awarded_this_run"
+						else
+							if sequential then
+								if oldCP >= (CheckpointConfig.FinishIndex - 1) then
+									canFinish = true
+									reason = "valid_sequential"
+								else
+									reason = "missing_checkpoint_" .. (CheckpointConfig.FinishIndex - 1)
+								end
+							else
+								canFinish = true
+								reason = "valid_skip_mode"
+							end
+						end
+					end
+
+					debugPrint(player.Name, "finish attempt - canFinish:", canFinish, "reason:", reason, "oldCP:", oldCP)
+
+					if canFinish then
+						if player:GetAttribute("SummitReady") ~= true then
+							ProfileManager.LoadSummitProfile(player)
+							task.wait(0.25)
+						end
+
+						PlayerSummitStatus[uid] = true
+						if RunId[uid] then
+							LastAwardedRunId[uid] = RunId[uid]
+						end
+
+						local ok, err = pcall(function()
+							awardSummit(player)
+
+							local cpLS = ensureLeaderstats(player)
+							cpLS.Value = CheckpointConfig.FinishIndex
+
+							player:SetAttribute("LapComplete", true)
+							player:SetAttribute("CPIndex", CheckpointConfig.FinishIndex)
+
+							checkpointValue.Value = CheckpointConfig.FinishIndex
+
+							MarkVisitedRE:FireClient(player, CheckpointConfig.FinishIndex, CheckpointConfig.FinishIndex, true)
+							debugPrint(player.Name, "completed summit!")
+						end)
+
+						if not ok then
+							warn("Finish flow error for", player.Name, err)
+							PlayerSummitStatus[uid] = false
+						end
+
+						task.delay(3, function()
+							if player and player.Parent and PlayerSummitStatus[uid] == true then
+								debugPrint("Auto-preparing", player.Name, "for next lap")
+								PlayerLapState[uid] = false
+								PlayerSummitStatus[uid] = false
+							end
+						end)
+
+						release()
+					else
+						if reason == "no_active_lap" then
+							CustomMessageRE:FireClient(player, "Kamu perlu menyentuh start (CP0) terlebih dahulu untuk memulai lap baru!")
+						elseif reason == "already_completed" or reason == "already_awarded_this_run" then
+							CustomMessageRE:FireClient(player, "Kamu sudah menyelesaikan lap ini. Sentuh start (CP0) untuk lap baru!")
+						else
+							SkipDeniedRE:FireClient(player, CheckpointConfig.FinishIndex - 1)
+						end
+						debugPrint(player.Name, "finish denied -", reason)
+						release()
+					end
+					return
+				end
+
+				if sequential then
+					local expectedNext = oldCP + 1
+
+					if checkpointIndex == expectedNext then
+						updatePlayerCP(player, checkpointIndex, true)
+						CheckpointDelay[uid] = now
+						debugPrint("Berhasil", player.Name, "reached checkpoint", checkpointIndex)
+					elseif checkpointIndex == oldCP then
+						MarkVisitedRE:FireClient(player, checkpointIndex, checkpointIndex, false)
+					elseif checkpointIndex > expectedNext then
+						SkipDeniedRE:FireClient(player, expectedNext)
+						debugPrint(player.Name, "tried to skip to", checkpointIndex, "expected", expectedNext)
+					else
+						PlayerLapState[uid] = false
+						PlayerSummitStatus[uid] = false
+						debugPrint(player.Name, "went backwards, invalidating lap")
+					end
+				else
+					if checkpointIndex > oldCP then
+						updatePlayerCP(player, checkpointIndex, true)
+						debugPrint(player.Name, "skipped to checkpoint", checkpointIndex)
+					elseif checkpointIndex == oldCP then
+						MarkVisitedRE:FireClient(player, checkpointIndex, checkpointIndex, false)
+					else
+						PlayerLapState[uid] = false
+						PlayerSummitStatus[uid] = false
+						debugPrint(player.Name, "went backwards in skip mode")
+					end
+				end
+			end
+		end)
+
+		connectedParts[part] = connection
+	end
+
+	local function disconnectCheckpointPart(part)
+		local connection = connectedParts[part]
+		if connection then
+			connection:Disconnect()
+			connectedParts[part] = nil
+		end
+	end
+
+	for _, part in ipairs(cpFolder:GetChildren()) do
+		connectCheckpointPart(part)
+	end
+
+	cpFolder.ChildAdded:Connect(function(part)
+		task.wait(0.1)
+		connectCheckpointPart(part)
+	end)
+
+	cpFolder.ChildRemoved:Connect(function(part)
+		disconnectCheckpointPart(part)
+	end)
+end
+
+Players.PlayerAdded:Connect(function(player)
+	local userIdString = tostring(player.UserId)
+	local uid = player.UserId
+
+	debugPrint("=== PLAYER JOINED ===", player.Name)
+
+	PlayerLoadingStatus[uid] = "loading"
+	PlayerLastActivity[uid] = os.time()
+
+	local override = CheckpointConfig.PerUserSequential and CheckpointConfig.PerUserSequential[uid]
+	local enforce = (override ~= nil) and override or (not CheckpointConfig.SkipMode)
+	EnforceSequential[uid] = enforce
+
+	local cpLS, summitLS = ensureLeaderstats(player)
+
+	task.spawn(function()
+		local loadedSummit = ProfileManager.LoadSummitProfile(player) or 0
+		local _, summitLS2 = ensureLeaderstats(player)
+		if loadedSummit > (summitLS2.Value or 0) then
+			summitLS2.Value = loadedSummit
+		end
+		player:SetAttribute("SummitReady", true)
+	end)
+
+	local checkpointValue = Instance.new("IntValue")
+	checkpointValue.Name = userIdString
+	checkpointValue.Parent = checkpointData
+
+	task.spawn(function()
+		local savedCP = CheckpointConfig.StartIndex
+
+		for attempt = 1, 5 do
+			savedCP = loadFromDataStore(player)
+			local profileData = ProfileManager.WaitForCheckpointProfile(player, 10)
+			if profileData and profileData >= 0 then
+				savedCP = profileData
+			end
+
+			if CheckpointConfig.IsValidIndex(savedCP) then
+				debugPrint("Loaded valid checkpoint for", player.Name, "CP:", savedCP, "attempt:", attempt)
+				break
+			else
+				warn("Invalid checkpoint loaded for", player.Name, "attempt:", attempt, "value:", savedCP)
+				if attempt < 5 then
+					task.wait(0.5 * attempt)
+				end
+			end
+		end
+
+		if not CheckpointConfig.IsValidIndex(savedCP) then
+			warn("Invalid checkpoint for", player.Name, "retry failed, using fallback safely")
+
+			savedCP = savedCP or CheckpointConfig.StartIndex
+		end
+
+		checkpointValue.Value = savedCP
+		cpLS.Value = savedCP
+
+		debugPrint("Profile loaded for", player.Name, "CP:", savedCP, "Will respawn at CP" .. savedCP)
+
+		if savedCP == CheckpointConfig.StartIndex then
+			PlayerLapState[uid] = true
+			PlayerSummitStatus[uid] = false
+		elseif savedCP == CheckpointConfig.FinishIndex then
+			PlayerLapState[uid] = false
+			PlayerSummitStatus[uid] = false
+		else
+			PlayerLapState[uid] = true
+			PlayerSummitStatus[uid] = false
+		end
+
+		if PlayerLapState[uid] then
+			RunId[uid] = HttpService:GenerateGUID(false)
+		else
+			RunId[uid] = nil
+		end
+
+		player:SetAttribute("CPIndex", savedCP)
+		player:SetAttribute("LapFromStart", savedCP > CheckpointConfig.StartIndex)
+		player:SetAttribute("LapComplete", (savedCP == CheckpointConfig.FinishIndex and PlayerSummitStatus[uid]))
+		player:SetAttribute("EnforceSequential", enforce)
+
+		for attempt = 1, 3 do
+			local success = applyRespawnLocationForPlayer(player, savedCP)
+			if success or attempt == 3 then
+				debugPrint("RespawnLocation set for", player.Name, "CP:", savedCP, "attempt:", attempt, "success:", success)
+				break
+			end
+			task.wait(0.2)
+		end
+
+		task.wait(0.5)
+
+		PlayerLoadingStatus[uid] = "loaded"
+
+		if player and player.Parent then
+			player:LoadCharacter()
+		end
+
+		debugPrint("Setup complete for", player.Name, "CP:", savedCP, "Lap:", PlayerLapState[uid], "Summit:", PlayerSummitStatus[uid])
+	end)
+
+	player.CharacterAdded:Connect(function(character)
+		debugPrint("=== CHARACTER SPAWNED ===", player.Name)
+
+		local waitTime = 0
+		while PlayerLoadingStatus[uid] == "loading" and waitTime < 15 do
+			task.wait(0.1)
+			waitTime = waitTime + 0.1
+		end
+
+		local hrp = character:WaitForChild("HumanoidRootPart", 10)
+		if not hrp then
+			warn("Failed to load HumanoidRootPart for", player.Name)
+			return
+		end
+
+		task.wait(0.3)
+
+		local currentCPVal = (checkpointData:FindFirstChild(userIdString) and checkpointData[userIdString].Value) or CheckpointConfig.StartIndex
+		if not CheckpointConfig.IsValidIndex(currentCPVal) then
+			currentCPVal = CheckpointConfig.StartIndex
+		end
+
+		debugPrint("Forcing teleport for", player.Name, "to CP" .. currentCPVal)
+
+		for attempt = 1, 5 do
+			local success = teleportToCheckpoint(character, currentCPVal, "force_spawn_teleport_attempt_" .. attempt)
+			if success then
+				debugPrint("Teleport successful for", player.Name, "attempt:", attempt)
+				break
+			end
+
+			if attempt < 5 then
+				task.wait(0.3 * attempt)
+			else
+				warn("Failed all teleport attempts for", player.Name, "to CP" .. currentCPVal)
+			end
+		end
+
+		local immSec = CheckpointConfig.SpawnTouchImmunitySeconds or 1
+		SpawnTouchImmunityUntil[uid] = os.clock() + immSec
+		local ff = Instance.new("ForceField")
+		ff.Visible = (CheckpointConfig.SpawnFFVisible == true)
+		ff.Parent = character
+		task.delay(immSec, function()
+			if ff and ff.Parent then ff:Destroy() end
+			SpawnTouchImmunityUntil[uid] = nil
+		end)
+
+		local humanoid = character:FindFirstChildOfClass("Humanoid")
+		if humanoid then
+			humanoid.Died:Connect(function()
+				local idx = player:GetAttribute("CPIndex") or cpLS.Value or CheckpointConfig.StartIndex
+				applyRespawnLocationForPlayer(player, idx)
+				task.delay(Players.RespawnTime or 2, function()
+					if player and player.Parent then
+						player:LoadCharacter()
+					end
+				end)
+			end)
+		end
+
+		currentCPVal = (checkpointData:FindFirstChild(userIdString) and checkpointData[userIdString].Value) or CheckpointConfig.StartIndex
+		debugPrint("Player", player.Name, "spawned, should be at CP" .. currentCPVal)
+
+		task.delay(0.1, function()
+			MarkVisitedRE:FireClient(player, currentCPVal, currentCPVal, false)
+			local visitedArr = {}
+			for i = CheckpointConfig.StartIndex, currentCPVal do
+				table.insert(visitedArr, i)
+			end
+			SyncStateRE:FireClient(player, currentCPVal, visitedArr)
+		end)
+	end)
+
+	player.Chatted:Connect(function(message)
+		if player.Name == "YourUsernameHere" then
+			if message:lower() == "/tp" then
+				local character = player.Character
+				if character then
+					local currentCPVal = (checkpointData:FindFirstChild(userIdString) and checkpointData[userIdString].Value) or CheckpointConfig.StartIndex
+					teleportToCheckpoint(character, currentCPVal, "admin_tp")
+					debugPrint("Admin teleported", player.Name, "to CP" .. currentCPVal)
+				end
+			elseif message:lower() == "/checkstate" then
+				local val = checkpointData:FindFirstChild(userIdString)
+				debugPrint("State for", player.Name, "CP:", val and val.Value or "?", "Lap:", PlayerLapState[uid], "Summit:", PlayerSummitStatus[uid], "RunId:", RunId[uid], "LastAwarded:", LastAwardedRunId[uid])
+			elseif message:match("^/setcp (%d+)$") then
+				local newCP = tonumber(message:match("^/setcp (%d+)$"))
+				if newCP and newCP >= CheckpointConfig.StartIndex and newCP <= CheckpointConfig.FinishIndex then
+					local val = checkpointData:FindFirstChild(userIdString)
+					if val then val.Value = newCP end
+					cpLS.Value = newCP
+					player:SetAttribute("CPIndex", newCP)
+					applyRespawnLocationForPlayer(player, newCP)
+					saveToDataStore(player, newCP, "admin_set")
+
+					if newCP == CheckpointConfig.FinishIndex then
+						PlayerLapState[uid] = false
+						PlayerSummitStatus[uid] = false
+						RunId[uid] = nil
+					else
+						PlayerLapState[uid] = true
+						PlayerSummitStatus[uid] = false
+						RunId[uid] = HttpService:GenerateGUID(false)
+					end
+
+					debugPrint("Admin set", player.Name, "to CP" .. newCP)
+
+					local character = player.Character
+					if character then
+						teleportToCheckpoint(character, newCP, "admin_set_tp")
+					end
+				end
+			end
+		end
+	end)
+end)
+
+Players.PlayerRemoving:Connect(function(player)
+	local userIdString = tostring(player.UserId)
+	local checkpointValue = checkpointData:FindFirstChild(userIdString)
+	local uid = player.UserId
+
+	debugPrint("Player leaving:", player.Name)
+
+	flushPendingSummit(player)
+
+	if checkpointValue then
+		debugPrint("Final save for", player.Name, "CP:", checkpointValue.Value)
+
+		for attempt = 1, 5 do
+			local success = saveToDataStore(player, checkpointValue.Value, "player_leaving")
+			if success then
+				debugPrint("Save successful on leave, attempt:", attempt)
+				break
+			end
+			if attempt < 5 then
+				task.wait(0.2 * attempt)
+			else
+				warn("Failed all save attempts for", player.Name)
+			end
+		end
+
+		task.wait(0.3)
+		checkpointValue:Destroy()
+	end
+
+	ProfileManager.ReleasePlayerProfiles(player)
+
+	PlayerLapState[uid] = nil
+	PlayerSummitStatus[uid] = nil
+	EnforceSequential[uid] = nil
+	PlayerLoadingStatus[uid] = nil
+	PlayerLastActivity[uid] = nil
+	GlobalTouchCD[uid] = nil
+	FinishLock[uid] = nil
+	RunId[uid] = nil
+	LastAwardedRunId[uid] = nil
+	PendingSummit[uid] = nil
+	SpawnTouchImmunityUntil[uid] = nil
+end)
+
+game:BindToClose(function()
+	debugPrint("Server shutting down, saving all checkpoints...")
+
+	for _, player in Players:GetPlayers() do
+		flushPendingSummit(player)
+	end
+
+	local savedCount = 0
+	for _, player in Players:GetPlayers() do
+		local userIdString = tostring(player.UserId)
+		local checkpointValue = checkpointData:FindFirstChild(userIdString)
+
+		if checkpointValue then
+			debugPrint("Shutdown save for", player.Name, "CP:", checkpointValue.Value)
+
+			for attempt = 1, 3 do
+				local success = saveToDataStore(player, checkpointValue.Value, "server_shutdown")
+				if success then
+					savedCount = savedCount + 1
+					break
+				end
+				if attempt < 3 then task.wait(0.2) end
+			end
+		end
+	end
+
+	debugPrint("Saved", savedCount, "checkpoints on shutdown")
+	task.wait(3)
+end)
+
+task.spawn(function()
+	while true do
+		task.wait(30)
+
+		for _, player in ipairs(Players:GetPlayers()) do
+			local userIdString = tostring(player.UserId)
+			local checkpointValue = checkpointData:FindFirstChild(userIdString)
+
+			if checkpointValue then
+				saveToDataStore(player, checkpointValue.Value, "autosave")
+			end
+		end
+
+		debugPrint("Autosave completed")
+	end
+end)
+
+setupSpawnLocations()
+setupCheckpointTouchSystem()
