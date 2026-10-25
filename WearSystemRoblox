@@ -1,0 +1,266 @@
+--[[
+	WEAR OUTFIT SYSTEM (R15)
+	Letakkan sebagai SCRIPT biasa (bukan LocalScript) di ServerScriptService.
+
+	Struktur Workspace yang dibutuhkan:
+	Workspace
+	 ├─ OutfitModels (Folder)
+	 │    ├─ Outfit1 (Model R15, berisi Humanoid + HumanoidRootPart)
+	 │    ├─ Outfit2
+	 │    ├─ Outfit3
+	 │    └─ Outfit4
+	 └─ ResetPart (Part)
+
+	ProximityPrompt akan dibuat otomatis kalau belum ada,
+	tapi kamu juga boleh membuatnya manual dan mengatur propertinya sendiri.
+]]
+
+local Players = game:GetService("Players")
+local ServerStorage = game:GetService("ServerStorage")
+
+----------------------------------------------------------------------
+-- KONFIGURASI
+----------------------------------------------------------------------
+local OUTFIT_FOLDER_NAME = "OutfitModels"
+local RESET_PART_NAME = "ResetPart"
+local COOLDOWN = 1 -- detik, anti spam per player
+
+-- Aksesoris milik sistem delivery: TIDAK BOLEH dihapus / diganti
+local PROTECTED_ACCESSORIES = {
+	["BerasBulog"] = true,
+	["Indomie"] = true,
+	["KerupukSiBlack"] = true,
+	["Ompreng"] = true,
+	["Semangka"] = true,
+	["SemangkaFrame"] = true,
+	["Telur Tray"] = true,
+	["TelurTray"] = true, -- jaga-jaga kalau tanpa spasi
+}
+
+----------------------------------------------------------------------
+-- DATA
+----------------------------------------------------------------------
+local originalBackups = {} -- [userId] = Folder berisi outfit asli player
+local currentOutfit = {} -- [userId] = Model template yang sedang dipakai
+local lastUse = {} -- [userId] = waktu terakhir pakai prompt
+
+local backupRoot = Instance.new("Folder")
+backupRoot.Name = "OutfitBackups"
+backupRoot.Parent = ServerStorage
+
+----------------------------------------------------------------------
+-- HELPER
+----------------------------------------------------------------------
+local function isProtected(instance: Instance): boolean
+	return PROTECTED_ACCESSORIES[instance.Name] == true
+end
+
+local function isClothing(instance: Instance): boolean
+	return instance:IsA("Shirt") or instance:IsA("Pants") or instance:IsA("ShirtGraphic")
+end
+
+-- Item yang dianggap "outfit": pakaian + aksesoris yang TIDAK diproteksi
+local function isOutfitItem(instance: Instance): boolean
+	if isClothing(instance) then
+		return true
+	end
+	return instance:IsA("Accessory") and not isProtected(instance)
+end
+
+-- Hapus semua outfit di karakter (aksesoris delivery tetap aman)
+local function wipeOutfit(character: Model)
+	for _, child in ipairs(character:GetChildren()) do
+		if isOutfitItem(child) then
+			child:Destroy()
+		end
+	end
+end
+
+-- Terapkan outfit dari "source" (Model template ATAU Folder backup)
+local function applyOutfitFrom(character: Model, humanoid: Humanoid, source: Instance)
+	wipeOutfit(character)
+
+	for _, item in ipairs(source:GetChildren()) do
+		if isClothing(item) then
+			item:Clone().Parent = character
+		elseif item:IsA("Accessory") and not isProtected(item) then
+			humanoid:AddAccessory(item:Clone())
+		end
+	end
+end
+
+-- Simpan outfit asli player (hanya sekali, saat pertama kali spawn)
+local function backupOriginal(player: Player, character: Model)
+	if originalBackups[player.UserId] then
+		return
+	end
+
+	local folder = Instance.new("Folder")
+	folder.Name = tostring(player.UserId)
+
+	for _, child in ipairs(character:GetChildren()) do
+		if isOutfitItem(child) then
+			child:Clone().Parent = folder
+		end
+	end
+
+	folder.Parent = backupRoot
+	originalBackups[player.UserId] = folder
+end
+
+local function getAliveCharacter(player: Player): (Model?, Humanoid?)
+	local character = player.Character
+	local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+	if character and humanoid and humanoid.Health > 0 then
+		return character, humanoid
+	end
+	return nil, nil
+end
+
+local function onCooldown(player: Player): boolean
+	local now = os.clock()
+	local last = lastUse[player.UserId]
+	if last and now - last < COOLDOWN then
+		return true
+	end
+	lastUse[player.UserId] = now
+	return false
+end
+
+local function getOrCreatePrompt(parent: Instance, fallbackParent: Instance?): ProximityPrompt
+	local prompt = parent:FindFirstChildWhichIsA("ProximityPrompt", true)
+	if not prompt then
+		prompt = Instance.new("ProximityPrompt")
+		prompt.Parent = fallbackParent or parent
+	end
+	return prompt
+end
+
+----------------------------------------------------------------------
+-- PLAYER & KARAKTER
+----------------------------------------------------------------------
+local function onCharacterAdded(player: Player, character: Model)
+	local humanoid = character:WaitForChild("Humanoid", 10)
+	if not humanoid then
+		return
+	end
+
+	-- Tunggu avatar bawaan Roblox selesai dimuat
+	if not player:HasAppearanceLoaded() then
+		player.CharacterAppearanceLoaded:Wait()
+	end
+	if player.Character ~= character then
+		return
+	end
+
+	-- Simpan outfit asli (hanya terjadi sekali per sesi)
+	backupOriginal(player, character)
+
+	-- Respawn: pakai lagi outfit template terakhir (sampai player menekan Reset / rejoin)
+	local template = currentOutfit[player.UserId]
+	if template and template.Parent then
+		applyOutfitFrom(character, humanoid :: Humanoid, template)
+	end
+end
+
+local function onPlayerAdded(player: Player)
+	player.CharacterAdded:Connect(function(character)
+		onCharacterAdded(player, character)
+	end)
+	if player.Character then
+		task.spawn(onCharacterAdded, player, player.Character)
+	end
+end
+
+Players.PlayerAdded:Connect(onPlayerAdded)
+for _, player in ipairs(Players:GetPlayers()) do
+	onPlayerAdded(player)
+end
+
+Players.PlayerRemoving:Connect(function(player)
+	local userId = player.UserId
+	currentOutfit[userId] = nil
+	lastUse[userId] = nil
+	if originalBackups[userId] then
+		originalBackups[userId]:Destroy()
+		originalBackups[userId] = nil
+	end
+end)
+
+----------------------------------------------------------------------
+-- MODEL OUTFIT (4 avatar template)
+----------------------------------------------------------------------
+local function setupOutfitModel(model: Model)
+	local rootPart = model:FindFirstChild("HumanoidRootPart") or model.PrimaryPart
+	
+	local sound = model:FindFirstChildWhichIsA("Sound")
+	if not sound then
+		warn("[OutfitSystem] " .. model.Name .. " tidak punya Sound ting, dilewati.")
+		return
+	end
+	
+	if not rootPart then
+		warn("[OutfitSystem] " .. model.Name .. " tidak punya HumanoidRootPart, dilewati.")
+		return
+	end
+
+	local prompt = getOrCreatePrompt(model, rootPart)
+	prompt.ActionText = "Pakai Outfit"
+	prompt.ObjectText = model.Name
+	prompt.MaxActivationDistance = 10
+	prompt.KeyboardKeyCode = Enum.KeyCode.F
+	prompt.HoldDuration = 0.5
+	prompt.UIOffset = Vector2.new(130, 80)
+	prompt.RequiresLineOfSight = false
+
+	prompt.Triggered:Connect(function(player)
+		if onCooldown(player) then
+			return
+		end
+	
+		local character, humanoid = getAliveCharacter(player)
+		if not character or not humanoid then
+			return
+		end
+
+		currentOutfit[player.UserId] = model
+		applyOutfitFrom(character, humanoid, model)
+		sound:Play()
+	end)
+end
+
+local outfitFolder = workspace:WaitForChild(OUTFIT_FOLDER_NAME)
+for _, model in ipairs(outfitFolder:GetChildren()) do
+	if model:IsA("Model") then
+		setupOutfitModel(model)
+	end
+end
+
+----------------------------------------------------------------------
+-- PART RESET
+----------------------------------------------------------------------
+local resetPart = workspace:WaitForChild(RESET_PART_NAME)
+local sound = resetPart:FindFirstChildWhichIsA("Sound")
+local resetPrompt = getOrCreatePrompt(resetPart)
+resetPrompt.ActionText = "Reset Outfit"
+resetPrompt.ObjectText = "Avatar Asli"
+resetPrompt.RequiresLineOfSight = false
+
+resetPrompt.Triggered:Connect(function(player)
+	if onCooldown(player) then
+		return
+	end
+
+	local character, humanoid = getAliveCharacter(player)
+	if not character or not humanoid then
+		return
+	end
+
+	currentOutfit[player.UserId] = nil -- berhenti memakai template
+
+	local backup = originalBackups[player.UserId]
+	if backup then
+		applyOutfitFrom(character, humanoid, backup)
+	end
+	sound:Play()
+end)
