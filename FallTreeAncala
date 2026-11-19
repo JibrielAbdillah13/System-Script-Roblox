@@ -1,0 +1,612 @@
+--[[
+	TreeChopService (ModuleScript)
+	Lokasi: ServerScriptService.TreeChopService
+
+	Berisi logic KHUSUS pohon: state machine, deteksi hitbox versi pohon,
+	proses jatuh, despawn, fade-in respawn. Debounce & broadcast animasi
+	swing dipusatkan di ChopManager (dipakai bareng dgn BushCutService).
+]]
+
+local CollectionService = game:GetService("CollectionService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local ServerStorage = game:GetService("ServerStorage")
+local RunService = game:GetService("RunService")
+local Players = game:GetService("Players")
+local Debris = game:GetService("Debris")
+local TweenService = game:GetService("TweenService")
+
+local Config = require(ReplicatedStorage:WaitForChild("Modules"):WaitForChild("TreeChopConfig"))
+local ChopHitboxUtil = require(script.Parent:WaitForChild("ChopHitboxUtil"))
+
+local Remotes = ReplicatedStorage:WaitForChild("TreeChopRemotes")
+local ChopEffectRemote = Remotes:WaitForChild("ChopEffect")   -- server -> client (getar + sound hit, HANYA saat kena)
+
+local TreeChopService = {}
+
+-- State per pohon, key = model instance
+-- { state, hitsLeft, primaryPart, originalCFrame }
+local treesData = {}
+
+local STATE = {
+	IDLE = "Idle",
+	CHOPPING = "Chopping",
+	FALLING = "Falling",
+	DESPAWNED = "Despawned",
+	COOLDOWN = "Cooldown",
+}
+
+-- ============================================================
+-- HELPER
+-- ============================================================
+
+local function isLeafPart(part)
+	return part.Name:sub(1, #Config.LEAF_NAME_PREFIX) == Config.LEAF_NAME_PREFIX
+end
+
+local function setTreeVisualState(tree, visible)
+	for _, descendant in ipairs(tree:GetDescendants()) do
+		if descendant:IsA("BasePart") and not isLeafPart(descendant) then
+			descendant.CanCollide = visible
+			if visible then
+				descendant.Transparency = descendant:GetAttribute("_OriginalTransparency") or 0
+			else
+				if descendant:GetAttribute("_OriginalTransparency") == nil then
+					descendant:SetAttribute("_OriginalTransparency", descendant.Transparency)
+				end
+				descendant.Transparency = 1
+			end
+		end
+	end
+end
+
+local function fadeTreeIn(tree, duration)
+	local parts = {}
+	for _, descendant in ipairs(tree:GetDescendants()) do
+		if descendant:IsA("BasePart") and not isLeafPart(descendant) then
+			local originalTransparency = descendant:GetAttribute("_OriginalTransparency") or 0
+			table.insert(parts, {part = descendant, target = originalTransparency})
+			descendant.Transparency = 1
+			descendant.CanCollide = false
+		end
+	end
+
+	local startTime = os.clock()
+	local finished = false
+	local connection
+
+	local function snapToFinal()
+		for _, entry in ipairs(parts) do
+			if entry.part.Parent then
+				pcall(function()
+					entry.part.Transparency = entry.target
+					entry.part.CanCollide = true
+				end)
+			end
+		end
+	end
+
+	connection = RunService.Heartbeat:Connect(function()
+		if finished then return end
+		local t = math.clamp((os.clock() - startTime) / duration, 0, 1)
+		for _, entry in ipairs(parts) do
+			-- pcall: part bisa saja di-destroy di tengah fade (mis. pohon dihapus),
+			-- jangan biarkan 1 part mati bikin callback error & loop Heartbeat bocor
+			if entry.part.Parent then
+				pcall(function()
+					entry.part.Transparency = 1 - (1 - entry.target) * t
+				end)
+			end
+		end
+		if t >= 1 then
+			finished = true
+			if connection then connection:Disconnect() end
+			snapToFinal()
+		end
+	end)
+
+	-- Tunggu sampai fade BENAR-BENAR selesai (yielding), timeout pengaman
+	-- pakai waktu nyata (os.clock), bukan akumulasi nominal task.wait
+	while not finished and (os.clock() - startTime) < duration + 2 do
+		task.wait(0.1)
+	end
+
+	if not finished then
+		finished = true
+		if connection then connection:Disconnect() end
+		warn("[TreeChopService] fadeTreeIn timeout, dipaksa snap ke nilai akhir")
+		snapToFinal()
+	end
+end
+
+local function findPivotOffset(primaryPart)
+	return CFrame.new(0, -primaryPart.Size.Y / 2, 0)
+end
+
+-- ============================================================
+-- SAFE TWEEN WAIT (fix bug: tween di-Destroy sebelum Completed fire
+-- -> Completed:Wait() nyangkut selamanya -> state pohon permanen macet)
+--
+-- Daripada andalkan Debris:AddItem dgn timer yg balapan sama durasi
+-- tween (gampang keduluan kalau server lag sedikit saja), kita:
+-- 1. Tunggu Completed TAPI dibungkus timeout pengaman (FALL_DURATION + buffer).
+-- 2. Instance tween cuma di-Destroy manual SETELAH kita tahu hasilnya,
+--    bukan dijadwalkan di awal.
+-- ============================================================
+
+local function playTweenAndWait(valueObject, tween, maxWait)
+	local completed = false
+	local conn
+	conn = tween.Completed:Connect(function()
+		completed = true
+	end)
+
+	tween:Play()
+
+	local startTime = os.clock()
+	-- Timeout dihitung dari WAKTU NYATA (os.clock), bukan akumulasi nominal
+	-- task.wait(0.1) -- saat server lag, task.wait bisa balik lebih lama dari
+	-- 0.1s, jadi akumulasi nominal bikin total menunggu membengkak.
+	while not completed and (os.clock() - startTime) < maxWait do
+		task.wait(0.1)
+	end
+
+	if conn then
+		conn:Disconnect()
+	end
+
+	if not completed then
+		warn("[TreeChopService] Tween timeout setelah " .. maxWait .. "s, dipaksa lanjut (snap ke nilai akhir)")
+	end
+
+	-- Baru sekarang aman di-Destroy -- baik karena sudah Completed,
+	-- maupun karena kita sudah menyerah nunggu (timeout).
+	tween:Cancel()
+	valueObject:Destroy()
+
+	return completed
+end
+
+-- ============================================================
+-- INIT PER POHON
+-- ============================================================
+
+function TreeChopService.RegisterTree(tree)
+	if treesData[tree] then return end
+
+	local primaryPart = tree.PrimaryPart
+	if not primaryPart then
+		warn("[TreeChopService] Pohon '" .. tree:GetFullName() .. "' tidak punya PrimaryPart, dilewati.")
+		return
+	end
+
+	treesData[tree] = {
+		state = STATE.IDLE,
+		hitsLeft = Config.MAX_HITS,
+		primaryPart = primaryPart,
+		originalCFrame = primaryPart.CFrame,
+	}
+
+	tree:SetAttribute("State", STATE.IDLE)
+	tree:SetAttribute("HitsLeft", Config.MAX_HITS)
+	tree:SetAttribute("MaxHits", Config.MAX_HITS)
+
+	tree.Destroying:Connect(function()
+		treesData[tree] = nil
+	end)
+
+	print("[TreeChopService] Pohon terdaftar:", tree:GetFullName())
+end
+
+-- ============================================================
+-- DETEKSI HITBOX DI DEPAN PLAYER (khusus part "Batang")
+-- ============================================================
+
+local function findTreeInFrontOfPlayer(player)
+	local parts, hrp = ChopHitboxUtil.GetPartsInFrontOfPlayer(player)
+	if not hrp then return nil end
+
+	local nearestTree, nearestDist = nil, math.huge
+	for _, part in ipairs(parts) do
+		if part.Name == "Batang" then
+			local treeModel = part.Parent
+			if treeModel and CollectionService:HasTag(treeModel, Config.TREE_TAG) then
+				local dist = (hrp.Position - part.Position).Magnitude
+				if dist < nearestDist then
+					nearestTree = treeModel
+					nearestDist = dist
+				end
+			end
+		end
+	end
+
+	return nearestTree
+end
+
+-- ============================================================
+-- LOG DROP (dipakai saat pohon tumbang)
+-- ============================================================
+
+local function getLogFolder()
+	return ServerStorage:FindFirstChild(Config.LOG_FOLDER_NAME)
+end
+
+local function getDropPoolForTree(tree)
+	local tags = CollectionService:GetTags(tree)
+	for _, tag in ipairs(tags) do
+		if Config.DROP_POOLS[tag] then
+			return Config.DROP_POOLS[tag]
+		end
+	end
+	return Config.DROP_POOLS["default"] or {"smallLog", "mediumLog", "largeLog"}
+end
+
+local function dropLog(position, dropPool)
+	local logFolder = getLogFolder()
+	if not logFolder then
+		warn("[TreeChopService] ServerStorage." .. Config.LOG_FOLDER_NAME .. " tidak ditemukan!")
+		return
+	end
+
+	if not dropPool or #dropPool == 0 then return end
+	local logType = dropPool[math.random(#dropPool)]
+	local template = logFolder:FindFirstChild(logType)
+	if not template then
+		warn("[TreeChopService] Template log '" .. logType .. "' tidak ada.")
+		return
+	end
+
+	-- Buat Model biasa (bukan Tool) untuk drop visual,
+	-- supaya tidak ter-trigger auto-equip bawaan Roblox
+	local logModel = Instance.new("Model")
+	logModel.Name = "DroppedLog_" .. logType
+
+	local srcHandle = template:FindFirstChild("Handle")
+	if not srcHandle then logModel:Destroy(); return end
+
+	local handle = srcHandle:Clone()
+	handle.CanCollide = true
+	handle.Anchored = false
+	handle.Parent = logModel
+
+	logModel.PrimaryPart = handle
+
+	local spawnPos = position + Vector3.new(0, 2, 0)
+	logModel:SetPrimaryPartCFrame(CFrame.new(spawnPos))
+
+	logModel:SetAttribute("LogType", logType)
+	logModel.Parent = workspace
+
+	task.defer(function()
+		if not handle.Parent then return end
+
+		local angle = math.random() * math.pi * 2
+		local hForce = math.random(Config.LOG_SCATTER_FORCE_MIN * 10, Config.LOG_SCATTER_FORCE_MAX * 10) / 10
+		local vForce = Config.LOG_UPWARD_FORCE
+
+		local impulse = Vector3.new(
+			math.cos(angle) * hForce,
+			vForce,
+			math.sin(angle) * hForce
+		) * handle.AssemblyMass
+
+		handle:ApplyImpulse(impulse)
+
+		local torque = Vector3.new(
+			(math.random() - 0.5) * 6,
+			(math.random() - 0.5) * 6,
+			(math.random() - 0.5) * 6
+		) * handle.AssemblyMass
+		handle:ApplyAngularImpulse(torque)
+	end)
+
+	local pickedUp = false
+	local conn: RBXScriptConnection?
+
+	conn = handle.Touched:Connect(function(hit)
+		if pickedUp then return end
+		local char = hit.Parent
+		if not char or not char:FindFirstChildOfClass("Humanoid") then return end
+
+		local player = Players:GetPlayerFromCharacter(char)
+		if not player then return end
+
+		pickedUp = true
+		if conn then conn:Disconnect(); conn = nil end
+
+		-- Sound 3D positional: di-parent ke part agar hanya terdengar player sekitar
+		-- (parent ke workspace root = terdengar global oleh semua player)
+		local snd = Instance.new("Sound")
+		snd.SoundId = Config.LOG_PICKUP_SOUND_ID
+		snd.Volume = Config.LOG_SOUND_VOLUME
+		snd.RollOffMaxDistance = 20
+		snd.RollOffMode = Enum.RollOffMode.InverseTapered
+
+		local hrp = char:FindFirstChild("HumanoidRootPart")
+		if hrp and hrp:IsA("BasePart") then
+			-- Ikut player yang mengambil log, terdengar positional di sekitarnya
+			snd.Parent = hrp
+			snd:Play()
+			Debris:AddItem(snd, 3)
+		else
+			-- Fallback: part sementara di posisi log agar tetap positional
+			local anchor = Instance.new("Part")
+			anchor.Anchored = true
+			anchor.CanCollide = false
+			anchor.Transparency = 1
+			anchor.Size = Vector3.one
+			anchor.Position = handle.Position
+			anchor.Parent = workspace
+			snd.Parent = anchor
+			snd:Play()
+			Debris:AddItem(anchor, 3)
+		end
+
+		local ltype = logModel:GetAttribute("LogType")
+		local kf = getLogFolder()
+		if kf then
+			local src = kf:FindFirstChild(ltype :: string)
+			if src then src:Clone().Parent = player.Backpack end
+		end
+
+		if logModel.Parent then logModel:Destroy() end
+	end)
+
+	task.delay(Config.LOG_DESPAWN_TIME, function()
+		if logModel and logModel.Parent and not pickedUp then
+			pickedUp = true
+			if conn then conn:Disconnect() end
+			logModel:Destroy()
+		end
+	end)
+end
+
+local function dropAllLogs(position, dropPool)
+	for _ = 1, Config.LOGS_PER_TREE do
+		task.spawn(dropLog, position, dropPool)
+		task.wait(0.05)
+	end
+end
+
+-- ============================================================
+-- VFX HIT (dipakai saat pohon dipukul)
+-- ============================================================
+
+local function showHitVFX(tree)
+	local folder = ReplicatedStorage:FindFirstChild("efeknebang")
+	if not folder then return end
+	local tmpl = folder:FindFirstChild("TreeBreakVFX")
+	if not tmpl then return end
+
+	local hitSpawn = tree:FindFirstChild("HitSpawn", true)
+	local spawnPos = hitSpawn and hitSpawn.Position or (tree.PrimaryPart and tree.PrimaryPart.Position)
+	if not spawnPos then return end
+
+	local vfx = tmpl:Clone()
+	vfx.Position = spawnPos
+	vfx.Anchored = true
+	vfx.Parent = workspace
+	for _, d in vfx:GetDescendants() do
+		if d:IsA("ParticleEmitter") then d.Enabled = true end
+	end
+	Debris:AddItem(vfx, 3)
+end
+
+-- ============================================================
+-- PROSES TUMBANG & RESPAWN
+-- ============================================================
+
+local function fellTree(tree)
+	local data = treesData[tree]
+	if not data then return end
+
+	data.state = STATE.FALLING
+	tree:SetAttribute("State", STATE.FALLING)
+
+	-- Deteksi tipe pohon berdasarkan TAG CollectionService (bukan sound)
+	local fallSound = tree:FindFirstChild("FallSound", true)
+	local destroySound = tree:FindFirstChild("DestroySound", true)
+	local isFallTree = CollectionService:HasTag(tree, Config.FALL_TREE_TAG)
+
+	if not isFallTree and not CollectionService:HasTag(tree, Config.DROP_TREE_TAG) then
+		warn("[TreeChopService] Pohon '" .. tree:GetFullName() .. "' tidak punya tag '" .. Config.FALL_TREE_TAG
+			.. "' atau '" .. Config.DROP_TREE_TAG .. "'. Diperlakukan sebagai pohon drop log.")
+	end
+
+	-- VFX saat pohon tumbang
+	showHitVFX(tree)
+
+	if isFallTree then
+		-- ===== POHON JALAN: tumbang 90 derajat, tidak drop log =====
+		if fallSound and fallSound:IsA("Sound") then
+			fallSound:Play()
+		end
+
+		local primaryPart = data.primaryPart
+		local originalCF = data.originalCFrame
+		local halfHeight = primaryPart.Size.Y / 2
+
+		-- CFrame dasar pohon (kaki batang)
+		local baseCF = originalCF * CFrame.new(0, -halfHeight, 0)
+		-- CFrame tumbang (rotasi 90 derajat dari kaki)
+		local fallenCF = baseCF * CFrame.Angles(0, 0, math.rad(Config.FALL_ANGLE)) * CFrame.new(0, halfHeight, 0)
+
+		task.spawn(function()
+			local ok, err = pcall(function()
+				-- ===== TWEEN JATUH =====
+				-- FIX: dulu pakai Debris:AddItem(cframeValue, FALL_DURATION + 1)
+				-- yg balapan sama tween-nya sendiri -- kalau server lag dikit
+				-- aja, cframeValue ke-Destroy SEBELUM Completed fire, dan
+				-- Completed:Wait() di bawah bakal nyangkut SELAMANYA (state
+				-- permanen "Falling", persis bug yg bikin pohon ga bisa ditebang
+				-- lagi). Sekarang pakai playTweenAndWait() yg punya timeout
+				-- pengaman + Destroy manual setelah hasil tween diketahui.
+				local fallValue = Instance.new("CFrameValue")
+				fallValue.Value = originalCF
+				fallValue.Changed:Connect(function(newCF)
+					tree:PivotTo(newCF)
+				end)
+
+				local fallTween = TweenService:Create(
+					fallValue,
+					TweenInfo.new(Config.FALL_DURATION, Enum.EasingStyle.Quad, Enum.EasingDirection.InOut),
+					{ Value = fallenCF }
+				)
+
+				local fallCompleted = playTweenAndWait(fallValue, fallTween, Config.FALL_DURATION + 2)
+				if not fallCompleted then
+					-- Timeout: paksa snap ke posisi akhir supaya visual tetap benar
+					tree:PivotTo(fallenCF)
+				end
+
+				data.state = STATE.DESPAWNED
+				tree:SetAttribute("State", STATE.DESPAWNED)
+
+				task.wait(Config.DESPAWN_WAIT)
+
+				-- ===== TWEEN RESET KE POSISI SEMULA =====
+				local spawnSound = tree:FindFirstChild("SpawnSound", true)
+				if spawnSound and spawnSound:IsA("Sound") then
+					spawnSound:Play()
+				end
+
+				local resetValue = Instance.new("CFrameValue")
+				resetValue.Value = fallenCF
+				resetValue.Changed:Connect(function(newCF)
+					tree:PivotTo(newCF)
+				end)
+
+				local resetTween = TweenService:Create(
+					resetValue,
+					TweenInfo.new(Config.SPAWN_FADE_DURATION, Enum.EasingStyle.Quad, Enum.EasingDirection.InOut),
+					{ Value = originalCF }
+				)
+
+				local resetCompleted = playTweenAndWait(resetValue, resetTween, Config.SPAWN_FADE_DURATION + 2)
+				if not resetCompleted then
+					tree:PivotTo(originalCF)
+				end
+
+				data.state = STATE.COOLDOWN
+				data.hitsLeft = Config.MAX_HITS
+				tree:SetAttribute("HitsLeft", Config.MAX_HITS)
+				tree:SetAttribute("State", STATE.COOLDOWN)
+				tree:SetAttribute("CooldownEndTime", workspace:GetServerTimeNow() + Config.RESPAWN_COOLDOWN)
+
+				task.wait(Config.RESPAWN_COOLDOWN)
+
+				data.state = STATE.IDLE
+				tree:SetAttribute("State", STATE.IDLE)
+			end)
+
+			if not ok then
+				-- SAFETY: jangan biarkan pohon nyangkut di state antara selamanya
+				-- (penyebab klasik "pohon tidak bisa ditebang lagi")
+				warn("[TreeChopService] Error di siklus pohon jalan, dipaksa reset: " .. tostring(err))
+				tree:PivotTo(originalCF)
+				data.state = STATE.IDLE
+				data.hitsLeft = Config.MAX_HITS
+				tree:SetAttribute("HitsLeft", Config.MAX_HITS)
+				tree:SetAttribute("State", STATE.IDLE)
+			end
+		end)
+
+	else
+		-- ===== POHON DROP LOG: hancur dan drop log =====
+		if destroySound and destroySound:IsA("Sound") then
+			destroySound:Play()
+		end
+
+		dropAllLogs(data.primaryPart.Position, getDropPoolForTree(tree))
+
+		setTreeVisualState(tree, false)
+
+		data.state = STATE.DESPAWNED
+		tree:SetAttribute("State", STATE.DESPAWNED)
+
+		task.spawn(function()
+			local ok, err = pcall(function()
+				task.wait(Config.DESPAWN_WAIT)
+
+				tree:PivotTo(data.originalCFrame)
+
+				-- Mainkan sound spawn yang sudah ada di dalam pohon
+				local spawnSound = tree:FindFirstChild("SpawnSound", true)
+				if spawnSound and spawnSound:IsA("Sound") then
+					spawnSound:Play()
+				end
+
+				-- Fade-in pohon dari transparan ke terlihat perlahan.
+				-- fadeTreeIn sekarang YIELDING: selesai return hanya setelah fade
+				-- benar-benar selesai (atau timeout), jadi state tidak lagi maju
+				-- duluan dari visual pohon (dulu pakai task.wait paralel yang bisa
+				-- beda tempo saat server hitch).
+				fadeTreeIn(tree, Config.SPAWN_FADE_DURATION)
+
+				data.state = STATE.COOLDOWN
+				data.hitsLeft = Config.MAX_HITS
+				tree:SetAttribute("HitsLeft", Config.MAX_HITS)
+				tree:SetAttribute("State", STATE.COOLDOWN)
+				tree:SetAttribute("CooldownEndTime", workspace:GetServerTimeNow() + Config.RESPAWN_COOLDOWN)
+
+				task.wait(Config.RESPAWN_COOLDOWN)
+
+				data.state = STATE.IDLE
+				tree:SetAttribute("State", STATE.IDLE)
+			end)
+
+			if not ok then
+				-- SAFETY: jangan biarkan pohon nyangkut di state antara selamanya
+				warn("[TreeChopService] Error di siklus pohon drop log, dipaksa reset: " .. tostring(err))
+				tree:PivotTo(data.originalCFrame)
+				setTreeVisualState(tree, true)
+				data.state = STATE.IDLE
+				data.hitsLeft = Config.MAX_HITS
+				tree:SetAttribute("HitsLeft", Config.MAX_HITS)
+				tree:SetAttribute("State", STATE.IDLE)
+			end
+		end)
+	end
+end
+
+-- ============================================================
+-- DIPANGGIL OLEH ChopManager SETELAH DELAY IMPACT
+-- Return true kalau ada batang TERDETEKSI di hitbox (dipakai ChopManager
+-- utk tahu apakah masih perlu cek semak juga atau tidak)
+-- ============================================================
+
+function TreeChopService.TryImpact(player)
+	local tree = findTreeInFrontOfPlayer(player)
+	if not tree then return false end
+
+	local data = treesData[tree]
+	if not data then
+		warn("[TreeChopService] Batang terdeteksi tapi model tidak terdaftar:", tree:GetFullName())
+		return true
+	end
+
+	if data.state ~= STATE.IDLE and data.state ~= STATE.CHOPPING then
+		print("[TreeChopService] Impact DITOLAK: state pohon sedang", data.state)
+		return true
+	end
+
+	data.state = STATE.CHOPPING
+	tree:SetAttribute("State", STATE.CHOPPING)
+
+	-- Damage tergantung skin kapak yang sedang di-equip (lihat Config.AXE_DAMAGE)
+	local damage = Config.GetAxeDamage(player)
+	data.hitsLeft = math.max(0, data.hitsLeft - damage)
+	tree:SetAttribute("HitsLeft", data.hitsLeft)
+
+	ChopEffectRemote:FireAllClients(player, tree, data.hitsLeft)
+
+	-- VFX saat pohon dipukul
+	showHitVFX(tree)
+
+	if data.hitsLeft <= 0 then
+		fellTree(tree)
+	end
+
+	return true
+end
+
+return TreeChopService
