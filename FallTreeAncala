@@ -71,51 +71,19 @@ local function fadeTreeIn(tree, duration)
 	end
 
 	local startTime = os.clock()
-	local finished = false
 	local connection
-
-	local function snapToFinal()
-		for _, entry in ipairs(parts) do
-			if entry.part.Parent then
-				pcall(function()
-					entry.part.Transparency = entry.target
-					entry.part.CanCollide = true
-				end)
-			end
-		end
-	end
-
 	connection = RunService.Heartbeat:Connect(function()
-		if finished then return end
 		local t = math.clamp((os.clock() - startTime) / duration, 0, 1)
 		for _, entry in ipairs(parts) do
-			-- pcall: part bisa saja di-destroy di tengah fade (mis. pohon dihapus),
-			-- jangan biarkan 1 part mati bikin callback error & loop Heartbeat bocor
-			if entry.part.Parent then
-				pcall(function()
-					entry.part.Transparency = 1 - (1 - entry.target) * t
-				end)
-			end
+			entry.part.Transparency = 1 - (1 - entry.target) * t
 		end
 		if t >= 1 then
-			finished = true
-			if connection then connection:Disconnect() end
-			snapToFinal()
+			for _, entry in ipairs(parts) do
+				entry.part.CanCollide = true
+			end
+			connection:Disconnect()
 		end
 	end)
-
-	-- Tunggu sampai fade BENAR-BENAR selesai (yielding), timeout pengaman
-	-- pakai waktu nyata (os.clock), bukan akumulasi nominal task.wait
-	while not finished and (os.clock() - startTime) < duration + 2 do
-		task.wait(0.1)
-	end
-
-	if not finished then
-		finished = true
-		if connection then connection:Disconnect() end
-		warn("[TreeChopService] fadeTreeIn timeout, dipaksa snap ke nilai akhir")
-		snapToFinal()
-	end
 end
 
 local function findPivotOffset(primaryPart)
@@ -142,12 +110,10 @@ local function playTweenAndWait(valueObject, tween, maxWait)
 
 	tween:Play()
 
-	local startTime = os.clock()
-	-- Timeout dihitung dari WAKTU NYATA (os.clock), bukan akumulasi nominal
-	-- task.wait(0.1) -- saat server lag, task.wait bisa balik lebih lama dari
-	-- 0.1s, jadi akumulasi nominal bikin total menunggu membengkak.
-	while not completed and (os.clock() - startTime) < maxWait do
+	local waited = 0
+	while not completed and waited < maxWait do
 		task.wait(0.1)
+		waited += 0.1
 	end
 
 	if conn then
@@ -535,12 +501,9 @@ local function fellTree(tree)
 					spawnSound:Play()
 				end
 
-				-- Fade-in pohon dari transparan ke terlihat perlahan.
-				-- fadeTreeIn sekarang YIELDING: selesai return hanya setelah fade
-				-- benar-benar selesai (atau timeout), jadi state tidak lagi maju
-				-- duluan dari visual pohon (dulu pakai task.wait paralel yang bisa
-				-- beda tempo saat server hitch).
+				-- Fade-in pohon dari transparan ke terlihat perlahan
 				fadeTreeIn(tree, Config.SPAWN_FADE_DURATION)
+				task.wait(Config.SPAWN_FADE_DURATION)
 
 				data.state = STATE.COOLDOWN
 				data.hitsLeft = Config.MAX_HITS
