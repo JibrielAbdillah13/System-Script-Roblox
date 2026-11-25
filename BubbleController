@@ -1,0 +1,420 @@
+-- BubbleController
+-- Logic inti: buat bubble, kontrol pergerakan tiap frame, deteksi landing/pop.
+-- Server-authoritative penuh — tidak ada RemoteEvent untuk pergerakan,
+-- input dibaca langsung dari Humanoid.MoveDirection (otomatis jalan di WASD & mobile analog).
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local Debris = game:GetService("Debris")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local Config = require(ReplicatedStorage.Modules:WaitForChild("BubbleConfig"))
+
+local BubbleController = {}
+local activeBubbles = {} -- [Player] = state
+
+local function getPlayerFromHit(hit)
+	local character = hit:FindFirstAncestorOfClass("Model")
+	if not character then return nil end
+	local humanoid = character:FindFirstChildOfClass("Humanoid")
+	if not humanoid then return nil end
+	local player = Players:GetPlayerFromCharacter(character)
+	return player, character
+end
+
+function BubbleController.IsRiding(player)
+	return activeBubbles[player] ~= nil
+end
+
+function BubbleController.StartBubble(player, mode, targetPart)
+	if activeBubbles[player] then return end -- sudah naik bubble lain, abaikan
+	local character = player.Character
+	if not character then return end
+
+	local humanoid = character:FindFirstChildOfClass("Humanoid")
+	local root = character:FindFirstChild("HumanoidRootPart")
+	if not humanoid or not root or humanoid.Health <= 0 then return end
+
+	if not targetPart then
+		warn("[BubbleController] Trigger tidak punya child ObjectValue 'TargetPart':", player.Name)
+		return
+	end
+
+	-- === Deteksi tinggi avatar, perkecil jika melebihi batas ===
+	local MAX_HEIGHT = 8.5
+	local extentsSize = character:GetExtentsSize()
+	local avatarHeight = extentsSize.Y
+	local originalScale = character:GetScale()
+	local wasScaled = false
+
+	if avatarHeight > MAX_HEIGHT then
+		local targetHeight = 8.4 -- sedikit di bawah maksimal untuk safety margin
+		local scaleRatio = targetHeight / avatarHeight
+		local newScale = originalScale * scaleRatio
+		character:ScaleTo(newScale)
+		wasScaled = true
+	end
+
+	-- === Bubble visual ===
+	local bubble = Instance.new("Part")
+	bubble.Name = "PlayerBubble"
+	bubble.Shape = Enum.PartType.Ball
+	bubble.Material = Enum.Material.Glass
+	bubble.Color = Config.BubbleColor
+	bubble.Transparency = Config.BubbleTransparency
+	bubble.Size = Config.BubbleSize
+	bubble.Anchored = false
+	bubble.CanCollide = false
+	bubble.CanQuery = false
+	bubble.Massless = true
+	bubble.CFrame = root.CFrame
+	bubble.Parent = workspace
+
+	-- === Particle efek dari ReplicatedStorage ===
+	local particleTemplate = ReplicatedStorage:FindFirstChild("ParticleBubble")
+	if particleTemplate then
+		local particle = particleTemplate:Clone()
+		particle.Parent = bubble
+	else
+		warn("[BubbleController] 'ParticleBubble' tidak ditemukan di ReplicatedStorage!")
+	end
+
+	local weld = Instance.new("WeldConstraint")
+	weld.Part0 = root
+	weld.Part1 = bubble
+	weld.Parent = bubble
+
+	-- === Constraint kontrol gerak ===
+	-- LinearVelocity langsung mengatur kecepatan karakter, lebih reliable dari AlignPosition
+	-- untuk melayang karena gravitasi tidak bisa "menang" di frame manapun.
+	local attachment = Instance.new("Attachment")
+	attachment.Name = "BubbleDriveAttachment"
+	attachment.Parent = root
+
+	local linVel = Instance.new("LinearVelocity")
+	linVel.Attachment0 = attachment
+	linVel.MaxForce = 1e6
+	linVel.VectorVelocity = Vector3.zero
+	linVel.Parent = root
+
+	local alignOri = Instance.new("AlignOrientation")
+	alignOri.Attachment0 = attachment
+	alignOri.MaxTorque = 1e5
+	alignOri.Responsiveness = Config.AlignResponsiveness
+	alignOri.CFrame = root.CFrame
+	alignOri.Parent = root
+
+	-- Matikan gerakan bawaan Humanoid supaya tidak baku-hantam sama AlignPosition,
+	-- tapi MoveDirection tetap kebaca (WASD & analog mobile tetap kerja).
+	local originalWalkSpeed = 13
+	local originalAutoRotate = humanoid.AutoRotate
+	local originalPlatformStand = humanoid.PlatformStand
+	humanoid.WalkSpeed = 0
+	humanoid.AutoRotate = false
+
+	-- PlatformStand = true mematikan kontrol fisik bawaan Humanoid (gravitasi internal,
+	-- auto-balance, dll) sehingga AlignPosition bisa bebas menggerakkan karakter tanpa
+	-- melawan. MoveDirection tetap kebaca untuk input WASD/analog.
+	humanoid.PlatformStand = true
+
+	-- Nonaktifkan jump selama di dalam bubble
+	humanoid:SetStateEnabled(Enum.HumanoidStateType.Jumping, false)
+
+	-- === Massless: buat semua part tubuh jadi massless agar melayang lebih ringan ===
+	local originalMassless = {}
+	for _, part in ipairs(character:GetDescendants()) do
+		if part:IsA("BasePart") and part ~= root then
+			originalMassless[part] = part.Massless
+			part.Massless = true
+		end
+	end
+	
+	-- === Sound ambient ===
+	local ambientSound = Instance.new("Sound")
+	ambientSound.Name = "BubbleAmbient"
+	ambientSound.SoundId = Config.Sounds.Enter
+	ambientSound.Looped = true
+	ambientSound.Volume = 1
+	ambientSound.RollOffMaxDistance = 60
+	ambientSound.Parent = root
+	ambientSound:Play()
+
+	-- === Animasi melayang ===
+	local animTrack
+	local animator = humanoid:FindFirstChildOfClass("Animator")
+	if animator then
+		local anim = Instance.new("Animation")
+		anim.AnimationId = Config.AnimationId
+		local ok, track = pcall(function()
+			return animator:LoadAnimation(anim)
+		end)
+		if ok and track then
+			track.Priority = Enum.AnimationPriority.Action
+			track.Looped = true
+			track:Play(0.2)
+			animTrack = track
+		end
+	end
+
+	local state = {
+		player = player,
+		character = character,
+		humanoid = humanoid,
+		root = root,
+		bubble = bubble,
+		weld = weld,
+		attachment = attachment,
+		linVel = linVel,
+		alignOri = alignOri,
+		sound = ambientSound,
+		animTrack = animTrack,
+		originalWalkSpeed = originalWalkSpeed,
+		originalAutoRotate = originalAutoRotate,
+		originalPlatformStand = originalPlatformStand,
+		originalMassless = originalMassless,
+		originalScale = originalScale,
+		wasScaled = wasScaled,
+		mode = mode,
+		targetPart = targetPart,
+		startY = root.Position.Y,
+		targetY = targetPart.Position.Y,
+		desiredPos = root.Position,
+		startTime = os.clock(),
+		ended = false,
+	}
+	state.duration = math.max(math.abs(state.targetY - state.startY) / Config.VerticalSpeed, 0.5)
+
+
+	activeBubbles[player] = state
+
+	-- === Deteksi mendarat: bubble menyentuh TargetPart ===
+	state.landConn = bubble.Touched:Connect(function(hit)
+		if hit == targetPart then
+			BubbleController.EndBubble(player, "Landed")
+		end
+	end)
+
+	state.heartbeatConn = RunService.Heartbeat:Connect(function(dt)
+		BubbleController._Update(state, dt)
+	end)
+
+	return state
+end
+
+function BubbleController._Update(state, dt)
+	if state.ended then return end
+
+	local player = state.player
+	if player.Character ~= state.character or state.humanoid.Health <= 0 then
+		BubbleController.EndBubble(player, "Interrupted")
+		return
+	end
+
+	local root = state.root
+	local currentPos = root.Position
+
+	-- Hitung kecepatan vertikal: gerak konstan menuju targetY
+	local yDiff = state.targetY - currentPos.Y
+	local verticalVel = 0
+	if math.abs(yDiff) > 0.5 then
+		verticalVel = math.sign(yDiff) * Config.VerticalSpeed
+	end
+
+	-- Kontrol horizontal dari player (WASD / analog mobile -> MoveDirection)
+	local moveDir = state.humanoid.MoveDirection
+	local horizontalVel = Vector3.new(moveDir.X, 0, moveDir.Z) * Config.HorizontalSpeed
+
+	-- Efek ombak-ambing melayang (derivatif dari sin -> cos untuk velocity)
+	local bobVel = math.cos(os.clock() * Config.BobSpeed) * Config.BobSpeed * Config.BobAmplitude
+
+	-- Set velocity langsung — LinearVelocity akan apply force untuk mencapai velocity ini
+	state.linVel.VectorVelocity = Vector3.new(horizontalVel.X, verticalVel + bobVel, horizontalVel.Z)
+
+	-- Rotasi menghadap arah gerak
+	if moveDir.Magnitude > 0 then
+		local lookCFrame = CFrame.lookAt(currentPos, currentPos + Vector3.new(moveDir.X, 0, moveDir.Z))
+		state.alignOri.CFrame = lookCFrame
+	end
+
+end
+
+function BubbleController.EndBubble(player, reason)
+	local state = activeBubbles[player]
+	if not state or state.ended then return end
+	state.ended = true
+	activeBubbles[player] = nil
+
+	if state.landConn then state.landConn:Disconnect() end
+	if state.heartbeatConn then state.heartbeatConn:Disconnect() end
+	if state.animTrack then state.animTrack:Stop(0.2) end
+	if state.sound then
+		state.sound:Stop()
+		state.sound:Destroy()
+	end
+	if state.linVel then state.linVel:Destroy() end
+	if state.alignOri then state.alignOri:Destroy() end
+	if state.attachment then state.attachment:Destroy() end
+	if state.weld then state.weld:Destroy() end
+
+
+	--Yg ditambahkan
+	if state.humanoid then
+		state.humanoid:SetStateEnabled(Enum.HumanoidStateType.Jumping, true)
+		state.humanoid.PlatformStand = state.originalPlatformStand
+		state.humanoid.WalkSpeed = state.originalWalkSpeed
+		state.humanoid.AutoRotate = state.originalAutoRotate
+	end
+
+	-- Kembalikan nilai Massless ke kondisi semula
+	if state.originalMassless then
+		for part, wasMassless in pairs(state.originalMassless) do
+			if part and part.Parent then
+				part.Massless = wasMassless
+			end
+		end
+	end
+
+	-- Kembalikan scale karakter ke ukuran semula jika sebelumnya diperkecil
+	if state.wasScaled and state.character then
+		state.character:ScaleTo(state.originalScale)
+	end
+
+	-- Sound pecah, didengar player di sekitar lokasi pecah
+	local popOrigin = state.root and state.root.Position
+	if popOrigin then
+		for _, plr in ipairs(Players:GetPlayers()) do
+			local hrp = plr.Character and plr.Character:FindFirstChild("HumanoidRootPart")
+			if hrp and (hrp.Position - popOrigin).Magnitude <= Config.PopSoundRadius then
+				local pop = Instance.new("Sound")
+				pop.SoundId = Config.Sounds.Pop
+				pop.Volume = 1
+				pop.RollOffMaxDistance = 50
+				pop.Parent = hrp
+				pop:Play()
+				Debris:AddItem(pop, 3)
+			end
+		end
+	end
+
+	if state.bubble then state.bubble:Destroy() end
+
+	if reason == "Popped" and state.character then
+		local spawnName = (state.mode == "Naik") and Config.SpawnPartNaik or Config.SpawnPartTurun
+		local spawnPart = workspace:FindFirstChild(spawnName, true)
+		if spawnPart then
+			task.wait(0.3)
+			state.character:PivotTo(spawnPart.CFrame + Vector3.new(0, 3, 0))
+			if state.root then
+				state.root.AssemblyLinearVelocity = Vector3.zero
+			end
+		else
+			warn("[BubbleController] Part spawn '" .. spawnName .. "' tidak ditemukan di workspace!")
+		end
+	end
+end
+
+function BubbleController.Init()
+	local CollectionService = game:GetService("CollectionService")
+	local TAG_NAIK = "BubbleTriggerNaik"
+	local TAG_TURUN = "BubbleTriggerTurun"
+	local TAG_DURI = "BubbleDuri"
+
+	-- === Blokir player yang sedang carry agar tidak bisa masuk bubble ===
+	local SoundService = game:GetService("SoundService")
+	local carryBlockCooldown = {} -- anti-spam teleport/sound saat Touched berulang
+
+	local function isPlayerInCarry(character)
+		local carryInfo = character:FindFirstChild("CarryInfo")
+		if not carryInfo then return false end
+		local isCarrying = carryInfo:FindFirstChild("IsCarrying")
+		local isBeingCarried = carryInfo:FindFirstChild("IsBeingCarried")
+		if isCarrying and isCarrying.Value then return true end
+		if isBeingCarried and isBeingCarried.Value then return true end
+		return false
+	end
+
+	local function rejectCarryPlayer(player, character)
+		if carryBlockCooldown[player] then return end
+		carryBlockCooldown[player] = true
+		task.delay(1, function()
+			carryBlockCooldown[player] = nil
+		end)
+
+		local root = character:FindFirstChild("HumanoidRootPart")
+
+		-- Putar SoundError dari karakter player tersebut
+		local soundTemplate = SoundService:FindFirstChild("SoundError")
+		if root and soundTemplate then
+			local errSound = soundTemplate:Clone()
+			errSound.Parent = root
+			errSound:Play()
+			Debris:AddItem(errSound, 3)
+		elseif not soundTemplate then
+			warn("[BubbleController] 'SoundError' tidak ditemukan di SoundService!")
+		end
+
+		-- Teleport player ke spawnteleportNaik
+		local spawnNaik = workspace:FindFirstChild("spawnteleportNaik")
+		if spawnNaik then
+			character:PivotTo(spawnNaik.CFrame + Vector3.new(0, 3, 0))
+			if root then
+				root.AssemblyLinearVelocity = Vector3.zero
+			end
+		else
+			warn("[BubbleController] Part 'spawnteleportNaik' tidak ditemukan di workspace!")
+		end
+	end
+
+	local function bindTrigger(part, mode)
+		part.Touched:Connect(function(hit)
+			local player, character = getPlayerFromHit(hit)
+			if not player then return end
+
+			-- Player yang sedang carry tidak boleh masuk bubble
+			if isPlayerInCarry(character) then
+				rejectCarryPlayer(player, character)
+				return
+			end
+
+			local targetValue = part:FindFirstChild("TargetPart")
+			local targetPart = targetValue and targetValue.Value
+			BubbleController.StartBubble(player, mode, targetPart)
+		end)
+	end
+
+	local function bindSpike(part)
+		part.Touched:Connect(function(hit)
+			-- Hanya pecah jika yang menyentuh duri adalah bubble, bukan anggota tubuh player
+			if hit.Name ~= "PlayerBubble" then return end
+			for player, state in pairs(activeBubbles) do
+				if state.bubble == hit then
+					BubbleController.EndBubble(player, "Popped")
+					break
+				end
+			end
+		end)
+	end
+
+	for _, part in ipairs(CollectionService:GetTagged(TAG_NAIK)) do bindTrigger(part, "Naik") end
+	for _, part in ipairs(CollectionService:GetTagged(TAG_TURUN)) do bindTrigger(part, "Turun") end
+	for _, part in ipairs(CollectionService:GetTagged(TAG_DURI)) do bindSpike(part) end
+
+	-- Kalau ada trigger/duri ditambah belakangan (misal stage baru di gunung)
+	CollectionService:GetInstanceAddedSignal(TAG_NAIK):Connect(function(part) bindTrigger(part, "Naik") end)
+	CollectionService:GetInstanceAddedSignal(TAG_TURUN):Connect(function(part) bindTrigger(part, "Turun") end)
+	CollectionService:GetInstanceAddedSignal(TAG_DURI):Connect(bindSpike)
+
+	local function onPlayerAdded(player)
+		player.CharacterRemoving:Connect(function()
+			BubbleController.EndBubble(player, "Interrupted")
+		end)
+	end
+	Players.PlayerAdded:Connect(onPlayerAdded)
+	for _, p in ipairs(Players:GetPlayers()) do onPlayerAdded(p) end
+
+	Players.PlayerRemoving:Connect(function(player)
+		BubbleController.EndBubble(player, "Interrupted")
+	end)
+end
+
+return BubbleController
